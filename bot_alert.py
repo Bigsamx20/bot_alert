@@ -1,10 +1,11 @@
 import requests
 import pandas as pd
 import time
+import os  # <-- added for environment variables
 
 # ----------------- Telegram Settings -----------------
-TOKEN = "8276758800:AAEPjxoMAn_uXEkMyAqzQCrLmzl2pfE4Lf8"
-CHAT_ID = "6903033357"
+TOKEN = os.getenv("TOKEN")  # Get from Railway environment variable
+CHAT_ID = os.getenv("CHAT_ID")  # Get from Railway environment variable
 TELEGRAM_URL = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
 
 # ----------------- Load coin list -----------------
@@ -15,7 +16,6 @@ except FileNotFoundError:
     exit()
 
 # ----------------- Track last alerts -----------------
-# We now track per coin per timeframe
 timeframes = ["1", "5", "15", "60"]  # 1m, 5m, 15m, 1h
 last_alert = {coin: {tf: None for tf in timeframes} for coin in coins['coin']}
 
@@ -69,7 +69,6 @@ def get_prices(symbol, interval):
         return None
 
 # ----------------- Main loop -----------------
-# Send test alert once when bot starts
 send_alert("✅ Bot started successfully (EMA + RSI active)")
 
 while True:
