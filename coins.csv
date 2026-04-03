@@ -1,4 +1,4 @@
-coin,percent,direction,rsi_overbought,rsi_oversold
-BTCUSDT,2,both,90,10
-ETHUSDT,1.5,below,85,15
-SOLUSDT,4,both,80,20
+coin,percent,direction,rsi_overbought,rsi_oversold,bollinger_k,band_expand,band_shrink
+BTCUSDT,2,both,90,10,2,150,50
+ETHUSDT,1.5,below,85,15,2,100,30
+SOLUSDT,4,both,80,20,2,10,2
