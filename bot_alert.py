@@ -2,6 +2,7 @@ import requests
 import pandas as pd
 import time
 import os
+import threading
 
 # ----------------- Telegram Settings -----------------
 TOKEN = os.getenv("TOKEN")
@@ -29,7 +30,7 @@ for col in required_columns:
         print(f"Error: Missing required column '{col}' in coins.csv")
         exit()
 
-# Optional Bollinger columns for per-coin customization
+# Optional Bollinger columns
 if "bollinger_k" not in coins.columns:
     coins["bollinger_k"] = 2
 if "band_expand" not in coins.columns:
@@ -38,17 +39,12 @@ if "band_shrink" not in coins.columns:
     coins["band_shrink"] = 10
 
 # ----------------- Settings -----------------
-timeframes = ["1", "5", "15", "60"]
+timeframes = ["1", "5", "15", "60"]  # minutes
 
 # ----------------- Track last alerts -----------------
 last_alert = {
-    coin: {
-        tf: {
-            "ema": None,
-            "rsi_zone": None,
-            "bollinger": None
-        } for tf in timeframes
-    } for coin in coins["coin"]
+    coin: {tf: {"ema": None, "rsi_zone": None, "bollinger": None} for tf in timeframes}
+    for coin in coins["coin"]
 }
 
 # ----------------- Send Telegram alert -----------------
@@ -100,6 +96,17 @@ def check_bollinger_width(coin, tf):
     print(f"Upper Band: {upper_band.iloc[-1]:.2f}")
     print(f"Lower Band: {lower_band.iloc[-1]:.2f}")
 
+# ----------------- Interactive manual checker thread -----------------
+def manual_bollinger_input():
+    while True:
+        coin = input("Enter coin symbol for Bollinger check (or 'exit'): ").strip()
+        if coin.lower() == "exit":
+            break
+        tf = input("Enter timeframe in minutes (1,5,15,60): ").strip()
+        check_bollinger_width(coin, tf)
+
+threading.Thread(target=manual_bollinger_input, daemon=True).start()
+
 # ----------------- Start message -----------------
 send_alert("🚨 BOT STARTED: EMA + RSI + Bollinger Width + Manual Check 🚨")
 
@@ -128,26 +135,13 @@ while True:
 
                 df = pd.DataFrame(prices, columns=["close"])
 
-                # EMA
+                # -------- EMA --------
                 df["EMA200"] = df["close"].ewm(span=200, adjust=False).mean()
-
-                # RSI
-                delta = df["close"].diff()
-                gain = delta.clip(lower=0)
-                loss = -delta.clip(upper=0)
-                avg_gain = gain.rolling(window=14, min_periods=14).mean()
-                avg_loss = loss.rolling(window=14, min_periods=14).mean()
-                rs = avg_gain / avg_loss.replace(0, 1e-10)
-                df["RSI"] = 100 - (100 / (1 + rs))
-
                 current_price = df["close"].iloc[-1]
                 ema200 = df["EMA200"].iloc[-1]
-                rsi = df["RSI"].iloc[-1]
-
                 threshold_above = ema200 * (1 + percent / 100)
                 threshold_below = ema200 * (1 - percent / 100)
 
-                # -------- EMA Alert --------
                 ema_signal = None
                 if direction == "above" and current_price > threshold_above:
                     ema_signal = "above"
@@ -160,31 +154,36 @@ while True:
                         ema_signal = "below"
 
                 if ema_signal and last_alert[coin][tf]["ema"] != ema_signal:
-                    message = f"📊 {coin} | {tf}m\nType: EMA {'Breakout 🚀' if ema_signal=='above' else 'Breakdown 🔻'}\nPrice: {current_price:.2f}\nEMA200: {ema200:.2f}\nRSI: {rsi:.2f}\n"
+                    message = f"📊 {coin} | {tf}m\nEMA {'Breakout 🚀' if ema_signal=='above' else 'Breakdown 🔻'}\nPrice: {current_price:.2f}\nEMA200: {ema200:.2f}"
                     send_alert(message)
                     last_alert[coin][tf]["ema"] = ema_signal
-
                 if threshold_below <= current_price <= threshold_above:
                     last_alert[coin][tf]["ema"] = None
 
-                # -------- RSI Alert --------
+                # -------- RSI --------
+                delta = df["close"].diff()
+                gain = delta.clip(lower=0)
+                loss = -delta.clip(upper=0)
+                avg_gain = gain.rolling(window=14, min_periods=14).mean()
+                avg_loss = loss.rolling(window=14, min_periods=14).mean()
+                rs = avg_gain / avg_loss.replace(0, 1e-10)
+                df["RSI"] = 100 - (100 / (1 + rs))
+                rsi = df["RSI"].iloc[-1]
+
                 current_zone = None
                 if rsi >= rsi_overbought - 0.5 and rsi <= rsi_overbought + 0.5:
                     current_zone = "overbought"
                 elif rsi >= rsi_oversold - 0.5 and rsi <= rsi_oversold + 0.5:
                     current_zone = "oversold"
 
-                rsi_signal = None
                 if current_zone and current_zone != last_alert[coin][tf]["rsi_zone"]:
-                    rsi_signal = current_zone
-                    message = f"📊 {coin} | {tf}m\nType: RSI 🎯 ENTERED {current_zone.upper()} ZONE\nRSI: {rsi:.2f}\nPrice: {current_price:.2f}"
+                    message = f"📊 {coin} | {tf}m\nRSI 🎯 ENTERED {current_zone.upper()} ZONE\nRSI: {rsi:.2f}\nPrice: {current_price:.2f}"
                     send_alert(message)
-                    last_alert[coin][tf]["rsi_zone"] = rsi_signal
-
+                    last_alert[coin][tf]["rsi_zone"] = current_zone
                 if current_zone is None:
                     last_alert[coin][tf]["rsi_zone"] = None
 
-                # -------- Bollinger Band Width Alert --------
+                # -------- Bollinger Band Width --------
                 window = 20
                 sma = df["close"].rolling(window=window).mean()
                 std = df["close"].rolling(window=window).std()
@@ -202,7 +201,6 @@ while True:
                     message = f"📊 {coin} | {tf}m\nBollinger Band {bollinger_signal.upper()}\nWidth: {band_width:.2f}\nPrice: {current_price:.2f}"
                     send_alert(message)
                     last_alert[coin][tf]["bollinger"] = bollinger_signal
-
                 if band_shrink <= band_width <= band_expand:
                     last_alert[coin][tf]["bollinger"] = None
 
