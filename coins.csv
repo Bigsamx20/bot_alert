@@ -1,4 +1,4 @@
 coin,percent,direction,rsi_overbought,rsi_oversold
-BTCUSDT,2,above,90,10
+BTCUSDT,0.001,both,90,10
 ETHUSDT,1.5,below,85,15
 SOLUSDT,4,both,80,20
