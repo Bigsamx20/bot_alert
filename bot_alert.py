@@ -29,9 +29,14 @@ for col in required_columns:
         print(f"Error: Missing required column '{col}' in coins.csv")
         exit()
 
-# ----------------- Track last alerts -----------------
+# ----------------- Settings -----------------
 timeframes = ["1", "5", "15", "60"]
 
+RSI_OVERBOUGHT = 90
+RSI_OVERSOLD = 10
+TOLERANCE = 0.5  # how close RSI must be to 90 or 10
+
+# ----------------- Track last alerts -----------------
 last_alert = {
     coin: {
         tf: {
@@ -92,7 +97,7 @@ def get_prices(symbol, interval):
         return None
 
 # ----------------- Start message -----------------
-send_alert("🚨 BOT STARTED: EMA + RSI (Independent Alerts) 🚨")
+send_alert("🚨 BOT STARTED: EMA + RSI (PRECISION 90/10) 🚨")
 
 # ----------------- Main loop -----------------
 while True:
@@ -137,7 +142,7 @@ while True:
                 threshold_below = ema200 * (1 - percent / 100)
 
                 # ==================================================
-                # 🔥 EMA SIGNAL (independent)
+                # 🔥 EMA SIGNAL
                 # ==================================================
                 ema_signal = None
 
@@ -171,48 +176,46 @@ while True:
                             f"Below -{percent}%"
                         )
 
-                    print("EMA ALERT:")
-                    print(message)
                     send_alert(message)
                     last_alert[coin][tf]["ema"] = ema_signal
 
-                # Reset EMA alert
                 if threshold_below <= current_price <= threshold_above:
                     last_alert[coin][tf]["ema"] = None
 
                 # ==================================================
-                # 🔥 RSI SIGNAL (independent)
+                # 🎯 RSI SIGNAL (PRECISION 90 / 10)
                 # ==================================================
                 rsi_signal = None
 
-                if rsi > 70:
+                if abs(rsi - RSI_OVERBOUGHT) <= TOLERANCE:
                     rsi_signal = "overbought"
-                elif rsi < 30:
+                elif abs(rsi - RSI_OVERSOLD) <= TOLERANCE:
                     rsi_signal = "oversold"
 
                 if rsi_signal and last_alert[coin][tf]["rsi"] != rsi_signal:
                     if rsi_signal == "overbought":
                         message = (
                             f"📊 {coin} | {tf}m\n"
-                            f"Type: RSI ⚠️ OVERBOUGHT\n"
+                            f"Type: RSI 🎯 HIT 90\n"
                             f"RSI: {rsi:.2f}\n"
                             f"Price: {current_price:.2f}"
                         )
                     else:
                         message = (
                             f"📊 {coin} | {tf}m\n"
-                            f"Type: RSI 🟢 OVERSOLD\n"
+                            f"Type: RSI 🎯 HIT 10\n"
                             f"RSI: {rsi:.2f}\n"
                             f"Price: {current_price:.2f}"
                         )
 
-                    print("RSI ALERT:")
-                    print(message)
                     send_alert(message)
                     last_alert[coin][tf]["rsi"] = rsi_signal
 
-                # Reset RSI alert
-                if 30 <= rsi <= 70:
+                # Reset RSI
+                if not (
+                    abs(rsi - RSI_OVERBOUGHT) <= TOLERANCE or
+                    abs(rsi - RSI_OVERSOLD) <= TOLERANCE
+                ):
                     last_alert[coin][tf]["rsi"] = None
 
         print("Checked all coins... waiting 60 seconds\n")
