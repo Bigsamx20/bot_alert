@@ -84,7 +84,7 @@ def get_prices(symbol, interval):
         return None
 
 # ----------------- Start message -----------------
-send_alert("✅ Bot started successfully (EMA200 alert bot active)")
+send_alert("🚨 TEST ALERT - BOT IS WORKING 🚨")
 
 # ----------------- Main loop -----------------
 while True:
