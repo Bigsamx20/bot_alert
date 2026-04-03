@@ -4,8 +4,8 @@ import time
 import os
 
 # ----------------- Telegram Settings -----------------
-TOKEN = os.getenv("TOKEN")  # From Railway variable
-CHAT_ID = os.getenv("CHAT_ID")  # From Railway variable
+TOKEN = os.getenv("TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
 
 if not TOKEN or not CHAT_ID:
     print("Error: TOKEN or CHAT_ID is missing")
@@ -30,7 +30,7 @@ for col in required_columns:
         exit()
 
 # ----------------- Track last alerts -----------------
-timeframes = ["1", "5", "15", "60"]  # 1m, 5m, 15m, 1h
+timeframes = ["1", "5", "15", "60"]
 last_alert = {coin: {tf: None for tf in timeframes} for coin in coins["coin"]}
 
 # ----------------- Send Telegram alert -----------------
@@ -44,7 +44,7 @@ def send_alert(message):
     except Exception as e:
         print("Telegram exception:", e)
 
-# ----------------- Get prices from Bybit (v5 API) -----------------
+# ----------------- Get prices from Bybit -----------------
 def get_prices(symbol, interval):
     url = "https://api.bybit.com/v5/market/kline"
     params = {
@@ -77,14 +77,14 @@ def get_prices(symbol, interval):
 
     try:
         closes = [float(item[4]) for item in data["result"]["list"]]
-        closes.reverse()  # oldest -> newest
+        closes.reverse()
         return closes
     except Exception as e:
         print(f"Parsing error for {symbol} ({interval}m): {e}")
         return None
 
 # ----------------- Start message -----------------
-send_alert("🚨 TEST ALERT - BOT IS WORKING 🚨")
+send_alert("🚨 TEST ALERT - BOT WITH RSI IS RUNNING 🚨")
 
 # ----------------- Main loop -----------------
 while True:
@@ -105,33 +105,54 @@ while True:
                     continue
 
                 df = pd.DataFrame(prices, columns=["close"])
+
+                # ----------------- EMA -----------------
                 df["EMA200"] = df["close"].ewm(span=200, adjust=False).mean()
 
+                # ----------------- RSI (safe version) -----------------
+                delta = df["close"].diff()
+                gain = delta.clip(lower=0)
+                loss = -delta.clip(upper=0)
+
+                avg_gain = gain.rolling(window=14, min_periods=14).mean()
+                avg_loss = loss.rolling(window=14, min_periods=14).mean()
+
+                rs = avg_gain / avg_loss.replace(0, 1e-10)
+                df["RSI"] = 100 - (100 / (1 + rs))
+
+                # ----------------- Current values -----------------
                 current_price = df["close"].iloc[-1]
                 ema200 = df["EMA200"].iloc[-1]
+                rsi = df["RSI"].iloc[-1]
 
                 threshold_above = ema200 * (1 + percent / 100)
                 threshold_below = ema200 * (1 - percent / 100)
 
                 new_alert = None
 
-                if direction == "above" and current_price > threshold_above:
-                    new_alert = "above"
-                elif direction == "below" and current_price < threshold_below:
-                    new_alert = "below"
-                elif direction == "both":
-                    if current_price > threshold_above:
+                # ----------------- Signal logic WITH RSI filter -----------------
+                if direction == "above":
+                    if current_price > threshold_above and rsi < 70:
                         new_alert = "above"
-                    elif current_price < threshold_below:
+
+                elif direction == "below":
+                    if current_price < threshold_below and rsi > 30:
                         new_alert = "below"
 
-                # ----------------- Send alert if condition is newly met -----------------
+                elif direction == "both":
+                    if current_price > threshold_above and rsi < 70:
+                        new_alert = "above"
+                    elif current_price < threshold_below and rsi > 30:
+                        new_alert = "below"
+
+                # ----------------- Send alert -----------------
                 if new_alert and last_alert[coin][tf] != new_alert:
                     if new_alert == "above":
                         message = (
                             f"📊 {coin} | {tf}m\n"
                             f"Price: {current_price:.2f}\n"
                             f"EMA200: {ema200:.2f}\n"
+                            f"RSI: {rsi:.2f}\n"
                             f"Signal: 🚀 ABOVE +{percent}%\n"
                             f"Threshold: {threshold_above:.2f}"
                         )
@@ -140,6 +161,7 @@ while True:
                             f"📊 {coin} | {tf}m\n"
                             f"Price: {current_price:.2f}\n"
                             f"EMA200: {ema200:.2f}\n"
+                            f"RSI: {rsi:.2f}\n"
                             f"Signal: 🔻 BELOW -{percent}%\n"
                             f"Threshold: {threshold_below:.2f}"
                         )
@@ -149,11 +171,11 @@ while True:
                     send_alert(message)
                     last_alert[coin][tf] = new_alert
 
-                # ----------------- Reset alert when price returns inside range -----------------
+                # ----------------- Reset alert -----------------
                 if threshold_below <= current_price <= threshold_above:
                     last_alert[coin][tf] = None
 
-        print("Checked all coins for all timeframes... waiting 60 seconds\n")
+        print("Checked all coins... waiting 60 seconds\n")
         time.sleep(60)
 
     except Exception as e:
