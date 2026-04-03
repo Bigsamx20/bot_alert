@@ -31,7 +31,15 @@ for col in required_columns:
 
 # ----------------- Track last alerts -----------------
 timeframes = ["1", "5", "15", "60"]
-last_alert = {coin: {tf: None for tf in timeframes} for coin in coins["coin"]}
+
+last_alert = {
+    coin: {
+        tf: {
+            "ema": None,
+            "rsi": None
+        } for tf in timeframes
+    } for coin in coins["coin"]
+}
 
 # ----------------- Send Telegram alert -----------------
 def send_alert(message):
@@ -84,7 +92,7 @@ def get_prices(symbol, interval):
         return None
 
 # ----------------- Start message -----------------
-send_alert("🚨 TEST ALERT - BOT WITH RSI IS RUNNING 🚨")
+send_alert("🚨 BOT STARTED: EMA + RSI (Independent Alerts) 🚨")
 
 # ----------------- Main loop -----------------
 while True:
@@ -101,7 +109,7 @@ while True:
             for tf in timeframes:
                 prices = get_prices(coin, tf)
                 if prices is None or len(prices) < 200:
-                    print(f"Skipping {coin} ({tf}m): not enough price data")
+                    print(f"Skipping {coin} ({tf}m): not enough data")
                     continue
 
                 df = pd.DataFrame(prices, columns=["close"])
@@ -109,7 +117,7 @@ while True:
                 # ----------------- EMA -----------------
                 df["EMA200"] = df["close"].ewm(span=200, adjust=False).mean()
 
-                # ----------------- RSI (safe version) -----------------
+                # ----------------- RSI -----------------
                 delta = df["close"].diff()
                 gain = delta.clip(lower=0)
                 loss = -delta.clip(upper=0)
@@ -128,52 +136,84 @@ while True:
                 threshold_above = ema200 * (1 + percent / 100)
                 threshold_below = ema200 * (1 - percent / 100)
 
-                new_alert = None
+                # ==================================================
+                # 🔥 EMA SIGNAL (independent)
+                # ==================================================
+                ema_signal = None
 
-                # ----------------- Signal logic WITH RSI filter -----------------
-                if direction == "above":
-                    if current_price > threshold_above and rsi < 70:
-                        new_alert = "above"
-
-                elif direction == "below":
-                    if current_price < threshold_below and rsi > 30:
-                        new_alert = "below"
-
+                if direction == "above" and current_price > threshold_above:
+                    ema_signal = "above"
+                elif direction == "below" and current_price < threshold_below:
+                    ema_signal = "below"
                 elif direction == "both":
-                    if current_price > threshold_above and rsi < 70:
-                        new_alert = "above"
-                    elif current_price < threshold_below and rsi > 30:
-                        new_alert = "below"
+                    if current_price > threshold_above:
+                        ema_signal = "above"
+                    elif current_price < threshold_below:
+                        ema_signal = "below"
 
-                # ----------------- Send alert -----------------
-                if new_alert and last_alert[coin][tf] != new_alert:
-                    if new_alert == "above":
+                if ema_signal and last_alert[coin][tf]["ema"] != ema_signal:
+                    if ema_signal == "above":
                         message = (
                             f"📊 {coin} | {tf}m\n"
+                            f"Type: EMA Breakout 🚀\n"
                             f"Price: {current_price:.2f}\n"
                             f"EMA200: {ema200:.2f}\n"
                             f"RSI: {rsi:.2f}\n"
-                            f"Signal: 🚀 ABOVE +{percent}%\n"
-                            f"Threshold: {threshold_above:.2f}"
+                            f"Above +{percent}%"
                         )
                     else:
                         message = (
                             f"📊 {coin} | {tf}m\n"
+                            f"Type: EMA Breakdown 🔻\n"
                             f"Price: {current_price:.2f}\n"
                             f"EMA200: {ema200:.2f}\n"
                             f"RSI: {rsi:.2f}\n"
-                            f"Signal: 🔻 BELOW -{percent}%\n"
-                            f"Threshold: {threshold_below:.2f}"
+                            f"Below -{percent}%"
                         )
 
-                    print("Sending alert:")
+                    print("EMA ALERT:")
                     print(message)
                     send_alert(message)
-                    last_alert[coin][tf] = new_alert
+                    last_alert[coin][tf]["ema"] = ema_signal
 
-                # ----------------- Reset alert -----------------
+                # Reset EMA alert
                 if threshold_below <= current_price <= threshold_above:
-                    last_alert[coin][tf] = None
+                    last_alert[coin][tf]["ema"] = None
+
+                # ==================================================
+                # 🔥 RSI SIGNAL (independent)
+                # ==================================================
+                rsi_signal = None
+
+                if rsi > 70:
+                    rsi_signal = "overbought"
+                elif rsi < 30:
+                    rsi_signal = "oversold"
+
+                if rsi_signal and last_alert[coin][tf]["rsi"] != rsi_signal:
+                    if rsi_signal == "overbought":
+                        message = (
+                            f"📊 {coin} | {tf}m\n"
+                            f"Type: RSI ⚠️ OVERBOUGHT\n"
+                            f"RSI: {rsi:.2f}\n"
+                            f"Price: {current_price:.2f}"
+                        )
+                    else:
+                        message = (
+                            f"📊 {coin} | {tf}m\n"
+                            f"Type: RSI 🟢 OVERSOLD\n"
+                            f"RSI: {rsi:.2f}\n"
+                            f"Price: {current_price:.2f}"
+                        )
+
+                    print("RSI ALERT:")
+                    print(message)
+                    send_alert(message)
+                    last_alert[coin][tf]["rsi"] = rsi_signal
+
+                # Reset RSI alert
+                if 30 <= rsi <= 70:
+                    last_alert[coin][tf]["rsi"] = None
 
         print("Checked all coins... waiting 60 seconds\n")
         time.sleep(60)
