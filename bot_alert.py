@@ -17,7 +17,6 @@ TELEGRAM_URL = f"https://api.telegram.org/bot{TOKEN}"
 # ----------------- Load coins -----------------
 coins = pd.read_csv("coins.csv")
 
-# Defaults
 if "bollinger_k" not in coins.columns:
     coins["bollinger_k"] = 2
 if "band_expand" not in coins.columns:
@@ -27,7 +26,7 @@ if "band_shrink" not in coins.columns:
 
 timeframes = ["1", "5", "15", "60"]
 
-# ----------------- Track alerts (ANTI-SPAM) -----------------
+# ----------------- Track alerts -----------------
 last_alert = {
     coin: {tf: {"ema": None, "rsi": None, "bb": None} for tf in timeframes}
     for coin in coins["coin"]
@@ -43,7 +42,7 @@ def send_alert(message):
     except Exception as e:
         print("Telegram error:", e)
 
-# ----------------- FIXED Get Prices -----------------
+# ----------------- Get Prices (FIXED) -----------------
 def get_prices(symbol, interval):
     url = "https://api.bybit.com/v5/market/kline"
     params = {
@@ -55,29 +54,21 @@ def get_prices(symbol, interval):
 
     try:
         response = requests.get(url, params=params, timeout=10)
-
-        if response.status_code != 200:
-            print("HTTP error:", response.text)
-            return None
-
         data = response.json()
 
         if "result" not in data or "list" not in data["result"]:
-            print("Bad API response:", data)
             return None
 
         closes = [float(i[4]) for i in data["result"]["list"]]
         closes.reverse()
         return closes
 
-    except Exception as e:
-        print("Price fetch error:", e)
+    except:
         return None
 
-# ----------------- Manual Check (TELEGRAM) -----------------
+# ----------------- Manual Check -----------------
 def check_bollinger_width(coin, tf):
     prices = get_prices(coin, tf)
-
     if not prices:
         send_alert(f"{coin} {tf}m ❌ No data")
         return
@@ -100,7 +91,7 @@ def check_bollinger_width(coin, tf):
         f"Lower: {lower:.2f}"
     )
 
-# ----------------- Summary (TELEGRAM) -----------------
+# ----------------- Summary -----------------
 def show_summary(tf):
     message = f"📊 Summary | {tf}m\n"
 
@@ -123,7 +114,7 @@ def show_summary(tf):
 
     send_alert(message)
 
-# ----------------- TELEGRAM COMMAND LISTENER -----------------
+# ----------------- Telegram Listener -----------------
 def telegram_listener():
     last_update_id = None
 
@@ -156,30 +147,24 @@ def telegram_listener():
                 if len(parts) == 0:
                     continue
 
-                # -------- /check BTCUSDT 5 --------
                 if parts[0].lower() == "/check" and len(parts) == 3:
-                    coin = parts[1].upper()
-                    tf = parts[2]
-                    check_bollinger_width(coin, tf)
+                    check_bollinger_width(parts[1], parts[2])
 
-                # -------- /summary 5 --------
                 elif parts[0].lower() == "/summary" and len(parts) == 2:
-                    tf = parts[1]
-                    show_summary(tf)
+                    show_summary(parts[1])
 
                 else:
-                    send_alert("❌ Invalid command\nUse:\n/check BTCUSDT 5\n/summary 5")
+                    send_alert("❌ Use:\n/check BTCUSDT 5\n/summary 5")
 
         except Exception as e:
             print("Telegram error:", e)
 
         time.sleep(2)
 
-# Run Telegram listener
 threading.Thread(target=telegram_listener, daemon=True).start()
 
-# ----------------- START -----------------
-send_alert("🚨 BOT FULLY FIXED & RUNNING 🚨")
+# ----------------- Start -----------------
+send_alert("🚨 BOT RUNNING WITH FULL BB FORMAT 🚨")
 
 # ----------------- MAIN LOOP -----------------
 while True:
@@ -211,7 +196,11 @@ while True:
                     ema_signal = "below"
 
                 if ema_signal and last_alert[coin][tf]["ema"] != ema_signal:
-                    send_alert(f"{coin} {tf}m EMA {'🚀' if ema_signal=='above' else '🔻'}")
+                    send_alert(
+                        f"📊 {coin} | {tf}m\n"
+                        f"EMA {'BREAKOUT 🚀' if ema_signal=='above' else 'BREAKDOWN 🔻'}\n"
+                        f"Price: {price:.2f}\nEMA: {ema:.2f}"
+                    )
                     last_alert[coin][tf]["ema"] = ema_signal
 
                 if ema_signal is None:
@@ -231,13 +220,17 @@ while True:
                     rsi_signal = "low"
 
                 if rsi_signal and last_alert[coin][tf]["rsi"] != rsi_signal:
-                    send_alert(f"{coin} {tf}m RSI {'🔴' if rsi_signal=='high' else '🟢'} ({rsi:.2f})")
+                    send_alert(
+                        f"📊 {coin} | {tf}m\n"
+                        f"RSI {'OVERBOUGHT 🔴' if rsi_signal=='high' else 'OVERSOLD 🟢'}\n"
+                        f"RSI: {rsi:.2f}\nPrice: {price:.2f}"
+                    )
                     last_alert[coin][tf]["rsi"] = rsi_signal
 
                 if rsi_signal is None:
                     last_alert[coin][tf]["rsi"] = None
 
-                # Bollinger
+                # -------- BOLLINGER FULL FORMAT --------
                 sma = df["close"].rolling(20).mean()
                 std = df["close"].rolling(20).std()
 
@@ -253,8 +246,12 @@ while True:
 
                 if bb_signal and last_alert[coin][tf]["bb"] != bb_signal:
                     send_alert(
-                        f"{coin} {tf}m BB {'📈' if bb_signal=='expand' else '🔥'}\n"
-                        f"W:{width:.2f} P:{price:.2f}"
+                        f"📊 {coin} | {tf}m\n"
+                        f"Bollinger {'EXPANSION 📈' if bb_signal=='expand' else 'SQUEEZE 🔥'}\n"
+                        f"Width: {width:.2f}\n"
+                        f"Price: {price:.2f}\n"
+                        f"Upper: {upper:.2f}\n"
+                        f"Lower: {lower:.2f}"
                     )
                     last_alert[coin][tf]["bb"] = bb_signal
 
@@ -264,5 +261,5 @@ while True:
         time.sleep(60)
 
     except Exception as e:
-        print("Main loop error:", e)
+        print("Error:", e)
         time.sleep(30)
