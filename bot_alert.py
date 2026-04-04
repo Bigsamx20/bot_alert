@@ -1,130 +1,180 @@
+import os
+import time
+import tempfile
+import threading
 import requests
 import pandas as pd
-import time
-import os
-import threading
 import matplotlib.pyplot as plt
-import tempfile
 
-# ---------------- TELEGRAM ----------------
+# =========================
+# TELEGRAM / GENERAL CONFIG
+# =========================
 TOKEN = os.getenv("TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
 if not TOKEN or not CHAT_ID:
-    print("Missing TOKEN or CHAT_ID")
-    raise SystemExit
+    raise SystemExit("Missing TOKEN or CHAT_ID environment variables.")
 
 TELEGRAM_URL = f"https://api.telegram.org/bot{TOKEN}"
+BYBIT_KLINE_URL = "https://api.bybit.com/v5/market/kline"
+BYBIT_INSTRUMENTS_URL = "https://api.bybit.com/v5/market/instruments-info"
 
-# ---------------- FIXED RSI SETTINGS ----------------
+# Only these timeframes
+TIMEFRAMES = ["5", "15", "60"]
+
+# Fixed RSI for all coins
 RSI_OVERBOUGHT = 90
 RSI_OVERSOLD = 10
 RSI_TOLERANCE = 0.3
 
-# ---------------- EMA DISTANCE CLASSIFICATION ----------------
+# EMA distance classification
 EMA_CLASSIFICATION_TIMEFRAMES = {"5", "15", "60"}
-
 EMA_STRONG_MIN = 4.0
 EMA_VERY_STRONG_MIN = 6.0
 EMA_OVERSTRETCHED_MIN = 10.0
 
-# ---------------- FILES ----------------
-MANUAL_FILE = "coins.csv"
-
-# manual coins file keeps only your custom overrides / added coins
-try:
-    manual_coins = pd.read_csv(MANUAL_FILE)
-except Exception:
-    manual_coins = pd.DataFrame(columns=[
-        "coin", "percent", "direction", "band_expand", "band_shrink"
-    ])
-
-required_cols = ["coin", "percent", "direction", "band_expand", "band_shrink"]
-for col in required_cols:
-    if col not in manual_coins.columns:
-        manual_coins[col] = None
-
-manual_coins = manual_coins[required_cols]
-
-timeframes = ["1", "5", "15", "60"]
-
-# default settings for auto-fetched coins
+# Default settings for auto-fetched coins
 DEFAULT_PERCENT = 2.0
 DEFAULT_DIRECTION = "both"
 DEFAULT_BAND_EXPAND = 50.0
 DEFAULT_BAND_SHRINK = 10.0
 
-# this will hold the merged universe used by the bot
-coins = pd.DataFrame(columns=required_cols)
+# Files
+MANUAL_COINS_FILE = "coins.csv"
+REMOVED_COINS_FILE = "removed_coins.txt"
 
-# coins removed manually should stay removed even if Bybit still lists them
-removed_symbols = set()
+# =========================
+# FILE HELPERS
+# =========================
+def load_manual_coins() -> pd.DataFrame:
+    try:
+        df = pd.read_csv(MANUAL_COINS_FILE)
+    except Exception:
+        df = pd.DataFrame(columns=["coin", "percent", "direction", "band_expand", "band_shrink"])
 
-# ---------------- SAVE / LOAD ----------------
-def save_manual_coins():
-    manual_coins.to_csv(MANUAL_FILE, index=False)
+    required_cols = ["coin", "percent", "direction", "band_expand", "band_shrink"]
+    for col in required_cols:
+        if col not in df.columns:
+            df[col] = None
 
-# ---------------- TELEGRAM SEND ----------------
-def send_alert(msg: str):
+    # drop old RSI columns if they exist
+    for col in ["rsi_overbought", "rsi_oversold"]:
+        if col in df.columns:
+            df = df.drop(columns=[col])
+
+    return df[required_cols]
+
+def save_manual_coins(df: pd.DataFrame) -> None:
+    df.to_csv(MANUAL_COINS_FILE, index=False)
+
+def load_removed_symbols() -> set[str]:
+    if not os.path.exists(REMOVED_COINS_FILE):
+        return set()
+    try:
+        with open(REMOVED_COINS_FILE, "r", encoding="utf-8") as f:
+            return {line.strip().upper() for line in f if line.strip()}
+    except Exception:
+        return set()
+
+def save_removed_symbols(symbols: set[str]) -> None:
+    try:
+        with open(REMOVED_COINS_FILE, "w", encoding="utf-8") as f:
+            for sym in sorted(symbols):
+                f.write(sym + "\n")
+    except Exception as e:
+        print("save_removed_symbols error:", e)
+
+manual_coins = load_manual_coins()
+removed_symbols = load_removed_symbols()
+
+# merged active universe
+coins = pd.DataFrame(columns=["coin", "percent", "direction", "band_expand", "band_shrink"])
+
+# =========================
+# ALERT TRACKING
+# =========================
+last_alert: dict[str, dict[str, dict[str, str | None]]] = {}
+
+def init_coin_tracking(coin: str) -> None:
+    last_alert[coin] = {
+        tf: {
+            "ema": None,
+            "ema_strength": None,
+            "rsi": None,
+            "bb": None,
+            "candle": None,
+        }
+        for tf in TIMEFRAMES
+    }
+
+def sync_tracking_with_coin_universe() -> None:
+    current = set(coins["coin"].dropna().astype(str).str.upper())
+    existing = set(last_alert.keys())
+
+    for coin in current - existing:
+        init_coin_tracking(coin)
+
+    for coin in existing - current:
+        del last_alert[coin]
+
+# =========================
+# TELEGRAM HELPERS
+# =========================
+def send_alert(message: str) -> None:
     try:
         requests.get(
             f"{TELEGRAM_URL}/sendMessage",
-            params={"chat_id": CHAT_ID, "text": msg},
-            timeout=10
+            params={"chat_id": CHAT_ID, "text": message},
+            timeout=15,
         )
     except Exception as e:
         print("send_alert error:", e)
 
-def send_image(path: str, caption: str):
+def send_image(path: str, caption: str) -> None:
     try:
         with open(path, "rb") as img:
             requests.post(
                 f"{TELEGRAM_URL}/sendPhoto",
                 params={"chat_id": CHAT_ID, "caption": caption},
                 files={"photo": img},
-                timeout=20
+                timeout=30,
             )
     except Exception as e:
         print("send_image error:", e)
 
-# ---------------- BYBIT AUTO-FETCH ----------------
-def fetch_all_bybit_linear_symbols():
-    """
-    Fetch all Trading linear instruments from Bybit using pagination.
-    Official docs: /v5/market/instruments-info with category=linear,
-    limit up to 1000 and cursor pagination. status can filter trading pairs.
-    """
+# =========================
+# BYBIT DATA
+# =========================
+def fetch_all_bybit_linear_symbols() -> list[str]:
     symbols = []
     cursor = None
 
     while True:
         params = {
             "category": "linear",
-            "limit": 1000,
             "status": "Trading",
+            "limit": 1000,
         }
         if cursor:
             params["cursor"] = cursor
 
         try:
-            r = requests.get(
-                "https://api.bybit.com/v5/market/instruments-info",
-                params=params,
-                timeout=15
-            )
+            r = requests.get(BYBIT_INSTRUMENTS_URL, params=params, timeout=20)
             data = r.json()
 
-            if "result" not in data or "list" not in data["result"]:
+            result = data.get("result", {})
+            items = result.get("list", [])
+
+            if not items:
                 break
 
-            items = data["result"]["list"]
             for item in items:
                 symbol = item.get("symbol")
                 status = item.get("status")
                 if symbol and status == "Trading":
                     symbols.append(symbol.upper())
 
-            cursor = data["result"].get("nextPageCursor")
+            cursor = result.get("nextPageCursor")
             if not cursor:
                 break
 
@@ -134,11 +184,7 @@ def fetch_all_bybit_linear_symbols():
 
     return sorted(set(symbols))
 
-def rebuild_coin_universe():
-    """
-    Merge auto-fetched Bybit symbols with manual overrides.
-    Manual rows override defaults for matching symbols.
-    """
+def rebuild_coin_universe() -> None:
     global coins
 
     auto_symbols = fetch_all_bybit_linear_symbols()
@@ -157,98 +203,62 @@ def rebuild_coin_universe():
 
     auto_df = pd.DataFrame(auto_rows)
 
-    # normalize manual coins
-    if not manual_coins.empty:
-        temp_manual = manual_coins.copy()
-        temp_manual["coin"] = temp_manual["coin"].str.upper()
-    else:
-        temp_manual = manual_coins.copy()
+    manual_df = manual_coins.copy()
+    if not manual_df.empty:
+        manual_df["coin"] = manual_df["coin"].astype(str).str.upper()
+        manual_df = manual_df[~manual_df["coin"].isin(removed_symbols)]
 
-    # remove any manually removed symbols
-    if not temp_manual.empty:
-        temp_manual = temp_manual[~temp_manual["coin"].isin(removed_symbols)]
-
-    # merge: manual overrides auto
-    if auto_df.empty and temp_manual.empty:
-        coins = pd.DataFrame(columns=required_cols)
+    if auto_df.empty and manual_df.empty:
+        coins = pd.DataFrame(columns=["coin", "percent", "direction", "band_expand", "band_shrink"])
         return
 
     merged = auto_df.copy()
 
-    if not temp_manual.empty:
-        merged = merged[~merged["coin"].isin(temp_manual["coin"])]
-        merged = pd.concat([merged, temp_manual], ignore_index=True)
+    if not manual_df.empty:
+        merged = merged[~merged["coin"].isin(manual_df["coin"])]
+        merged = pd.concat([merged, manual_df], ignore_index=True)
 
     merged = merged.drop_duplicates(subset=["coin"], keep="last")
     merged = merged.sort_values("coin").reset_index(drop=True)
+    coins = merged[["coin", "percent", "direction", "band_expand", "band_shrink"]]
 
-    coins = merged[required_cols]
-
-# ---------------- TRACKING ----------------
-last_alert = {}
-
-def init_coin_tracking(coin: str):
-    last_alert[coin] = {
-        tf: {
-            "ema": None,
-            "ema_strength": None,
-            "rsi": None,
-            "bb": None,
-            "candle": None
-        }
-        for tf in timeframes
-    }
-
-def sync_tracking_with_coin_universe():
-    existing = set(last_alert.keys())
-    current = set(coins["coin"].dropna().str.upper())
-
-    for coin in current - existing:
-        init_coin_tracking(coin)
-
-    for coin in existing - current:
-        del last_alert[coin]
-
-# build initial universe
-rebuild_coin_universe()
-sync_tracking_with_coin_universe()
-
-# ---------------- GET DATA ----------------
-def get_ohlc(symbol: str, interval: str):
+def get_ohlc(symbol: str, interval: str) -> pd.DataFrame | None:
     try:
         r = requests.get(
-            "https://api.bybit.com/v5/market/kline",
+            BYBIT_KLINE_URL,
             params={
                 "category": "linear",
                 "symbol": symbol.upper(),
                 "interval": interval,
-                "limit": 200
+                "limit": 200,
             },
-            timeout=10
+            timeout=15,
         )
         data = r.json()
-
-        if "result" not in data or "list" not in data["result"]:
+        result = data.get("result", {})
+        rows = result.get("list", [])
+        if not rows:
             return None
 
-        rows = data["result"]["list"]
         rows.reverse()
 
-        df = pd.DataFrame(rows, columns=[
-            "start_time", "open", "high", "low", "close",
-            "volume", "turnover"
-        ])
+        df = pd.DataFrame(
+            rows,
+            columns=["start_time", "open", "high", "low", "close", "volume", "turnover"],
+        )
 
         for col in ["open", "high", "low", "close", "volume", "turnover"]:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
-        return df
+        return df.dropna().reset_index(drop=True)
     except Exception as e:
-        print("get_ohlc error:", e)
+        print(f"get_ohlc error for {symbol} {interval}: {e}")
         return None
 
-# ---------------- INDICATORS ----------------
-def add_indicators(df: pd.DataFrame):
+# =========================
+# INDICATORS
+# =========================
+def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
     df["EMA"] = df["close"].ewm(span=200, adjust=False).mean()
@@ -269,15 +279,16 @@ def add_indicators(df: pd.DataFrame):
 
     return df
 
-# ---------------- HELPERS ----------------
+# =========================
+# HELPERS
+# =========================
 def ema_distance_percent(price: float, ema: float) -> float:
     if ema == 0:
         return 0.0
     return ((price - ema) / ema) * 100
 
-def classify_ema_distance(distance_pct: float):
+def classify_ema_distance(distance_pct: float) -> str | None:
     abs_dist = abs(distance_pct)
-
     if abs_dist >= EMA_OVERSTRETCHED_MIN:
         return "overstretched"
     if abs_dist >= EMA_VERY_STRONG_MIN:
@@ -290,13 +301,11 @@ def classify_direction(distance_pct: float) -> str:
     return "above" if distance_pct > 0 else "below"
 
 def format_strength_label(level: str) -> str:
-    if level == "strong":
-        return "STRONG"
-    if level == "very_strong":
-        return "VERY STRONG"
-    if level == "overstretched":
-        return "OVERSTRETCHED"
-    return "NORMAL"
+    return {
+        "strong": "STRONG",
+        "very_strong": "VERY STRONG",
+        "overstretched": "OVERSTRETCHED",
+    }.get(level, "NORMAL")
 
 def get_strength_details(distance_pct: float, tf: str):
     if tf not in EMA_CLASSIFICATION_TIMEFRAMES:
@@ -310,8 +319,10 @@ def get_strength_details(distance_pct: float, tf: str):
     label = format_strength_label(level)
     return level, direction, label
 
-# ---------------- CHARTS ----------------
-def plot_standard_chart(df: pd.DataFrame, coin: str, tf: str):
+# =========================
+# CHARTS
+# =========================
+def plot_standard_chart(df: pd.DataFrame, coin: str, tf: str) -> str:
     df = add_indicators(df)
 
     fig, (ax1, ax2) = plt.subplots(
@@ -339,7 +350,7 @@ def plot_standard_chart(df: pd.DataFrame, coin: str, tf: str):
     plt.close()
     return tmp.name
 
-def plot_giant_candle_chart(df: pd.DataFrame, coin: str, tf: str):
+def plot_giant_candle_chart(df: pd.DataFrame, coin: str, tf: str) -> str:
     df = add_indicators(df)
 
     fig, (ax1, ax2) = plt.subplots(
@@ -371,8 +382,10 @@ def plot_giant_candle_chart(df: pd.DataFrame, coin: str, tf: str):
     plt.close()
     return tmp.name
 
-# ---------------- COMMANDS ----------------
-def check_bollinger_width(coin: str, tf: str):
+# =========================
+# COMMANDS
+# =========================
+def check_bollinger_width(coin: str, tf: str) -> None:
     df = get_ohlc(coin, tf)
     if df is None or len(df) < 20:
         send_alert(f"{coin} {tf}m ❌ No data")
@@ -406,10 +419,14 @@ def check_bollinger_width(coin: str, tf: str):
         f"Lower: {lower:.2f}"
     )
 
-    os.unlink(chart)
+    try:
+        os.unlink(chart)
+    except OSError:
+        pass
 
-def show_summary(tf: str):
+def show_summary(tf: str) -> None:
     msg = f"📊 Summary {tf}m\nRSI Zones: {RSI_OVERBOUGHT}/{RSI_OVERSOLD}\n"
+
     for _, r in coins.iterrows():
         coin = r["coin"]
         df = get_ohlc(coin, tf)
@@ -430,9 +447,11 @@ def show_summary(tf: str):
 
     send_alert(msg)
 
-# ---------------- TELEGRAM LISTENER ----------------
+# =========================
+# TELEGRAM LISTENER
+# =========================
 def telegram_listener():
-    global manual_coins, coins
+    global manual_coins, coins, removed_symbols
     last_update_id = None
 
     while True:
@@ -441,7 +460,7 @@ def telegram_listener():
             if last_update_id is not None:
                 params["offset"] = last_update_id + 1
 
-            res = requests.get(f"{TELEGRAM_URL}/getUpdates", params=params, timeout=15).json()
+            res = requests.get(f"{TELEGRAM_URL}/getUpdates", params=params, timeout=20).json()
 
             for upd in res.get("result", []):
                 last_update_id = upd["update_id"]
@@ -449,20 +468,21 @@ def telegram_listener():
                 if "message" not in upd:
                     continue
 
-                chat_id = upd["message"]["chat"]["id"]
-                text = upd["message"].get("text", "")
+                message = upd["message"]
+                chat_id = message["chat"]["id"]
+                text = message.get("text", "")
 
                 if str(chat_id) != str(CHAT_ID):
                     continue
 
                 parts = text.strip().split()
-
-                if len(parts) == 0:
+                if not parts:
                     continue
 
-                if parts[0] == "/add" and len(parts) == 2:
-                    data = parts[1].split(",")
+                cmd = parts[0].lower()
 
+                if cmd == "/add" and len(parts) == 2:
+                    data = parts[1].split(",")
                     if len(data) != 5:
                         send_alert("❌ Format:\n/add BTCUSDT,2,both,50,10")
                         continue
@@ -472,31 +492,34 @@ def telegram_listener():
 
                     if coin in removed_symbols:
                         removed_symbols.remove(coin)
+                        save_removed_symbols(removed_symbols)
 
-                    manual_coins = manual_coins[manual_coins["coin"].str.upper() != coin]
+                    manual_coins = manual_coins[manual_coins["coin"].astype(str).str.upper() != coin]
                     manual_coins.loc[len(manual_coins)] = [
                         coin, float(p), d.lower(), float(be), float(bs)
                     ]
 
-                    save_manual_coins()
+                    save_manual_coins(manual_coins)
                     rebuild_coin_universe()
                     sync_tracking_with_coin_universe()
 
                     send_alert(f"✅ {coin} added / updated\nRSI fixed at {RSI_OVERBOUGHT}/{RSI_OVERSOLD}")
 
-                elif parts[0] == "/remove" and len(parts) == 2:
+                elif cmd == "/remove" and len(parts) == 2:
                     coin = parts[1].upper()
 
                     removed_symbols.add(coin)
-                    manual_coins = manual_coins[manual_coins["coin"].str.upper() != coin]
-                    save_manual_coins()
+                    save_removed_symbols(removed_symbols)
+
+                    manual_coins = manual_coins[manual_coins["coin"].astype(str).str.upper() != coin]
+                    save_manual_coins(manual_coins)
 
                     rebuild_coin_universe()
                     sync_tracking_with_coin_universe()
 
                     send_alert(f"❌ {coin} removed")
 
-                elif parts[0] == "/list":
+                elif cmd == "/list":
                     if coins.empty:
                         send_alert("⚠️ No coins in list")
                     else:
@@ -505,20 +528,19 @@ def telegram_listener():
                             f"Universe: {len(coins)} symbols\n"
                             f"RSI fixed: {RSI_OVERBOUGHT}/{RSI_OVERSOLD}\n"
                         )
-                        # keep list manageable in Telegram
                         preview = coins["coin"].tolist()[:100]
                         msg += "\n".join(preview)
                         if len(coins) > 100:
                             msg += f"\n... and {len(coins) - 100} more"
                         send_alert(msg)
 
-                elif parts[0] == "/check" and len(parts) == 3:
+                elif cmd == "/check" and len(parts) == 3:
                     check_bollinger_width(parts[1].upper(), parts[2])
 
-                elif parts[0] == "/summary" and len(parts) == 2:
+                elif cmd == "/summary" and len(parts) == 2:
                     show_summary(parts[1])
 
-                elif parts[0] == "/refresh":
+                elif cmd == "/refresh":
                     rebuild_coin_universe()
                     sync_tracking_with_coin_universe()
                     send_alert(f"🔄 Refreshed Bybit universe\nTotal symbols: {len(coins)}")
@@ -540,9 +562,9 @@ def telegram_listener():
 
         time.sleep(2)
 
-threading.Thread(target=telegram_listener, daemon=True).start()
-
-# ---------------- AUTO REFRESH THREAD ----------------
+# =========================
+# AUTO REFRESH
+# =========================
 def auto_refresh_universe():
     while True:
         try:
@@ -550,19 +572,28 @@ def auto_refresh_universe():
             sync_tracking_with_coin_universe()
         except Exception as e:
             print("auto_refresh_universe error:", e)
-        time.sleep(3600)  # refresh every hour
+        time.sleep(3600)
 
+# =========================
+# STARTUP
+# =========================
+rebuild_coin_universe()
+sync_tracking_with_coin_universe()
+
+threading.Thread(target=telegram_listener, daemon=True).start()
 threading.Thread(target=auto_refresh_universe, daemon=True).start()
 
-# ---------------- START ----------------
 send_alert(
     f"🚨 FULL BOT RUNNING 🚨\n"
     f"Universe: {len(coins)} Bybit linear symbols\n"
     f"RSI fixed at {RSI_OVERBOUGHT}/{RSI_OVERSOLD}\n"
+    f"Timeframes: 5m / 15m / 60m\n"
     f"EMA strength alerts active on 5m / 15m / 60m"
 )
 
-# ---------------- MAIN LOOP ----------------
+# =========================
+# MAIN LOOP
+# =========================
 while True:
     try:
         for _, row in coins.iterrows():
@@ -572,7 +603,7 @@ while True:
             expand = float(row["band_expand"])
             shrink = float(row["band_shrink"])
 
-            for tf in timeframes:
+            for tf in TIMEFRAMES:
                 df = get_ohlc(coin, tf)
                 if df is None or len(df) < 200:
                     continue
@@ -583,7 +614,7 @@ while True:
                 ema = df["EMA"].iloc[-1]
                 distance_pct = ema_distance_percent(price, ema)
 
-                # ---------------- EMA ----------------
+                # ---------- EMA ----------
                 ema_signal = None
                 threshold_above = ema * (1 + percent / 100)
                 threshold_below = ema * (1 - percent / 100)
@@ -624,7 +655,7 @@ while True:
                 if threshold_below <= price <= threshold_above:
                     last_alert[coin][tf]["ema"] = None
 
-                # ---------------- EMA DISTANCE STRENGTH ----------------
+                # ---------- EMA DISTANCE STRENGTH ----------
                 strength_signal = None
                 strength_direction = None
 
@@ -649,11 +680,10 @@ while True:
                     )
                     last_alert[coin][tf]["ema_strength"] = strength_signal
 
-                if tf in EMA_CLASSIFICATION_TIMEFRAMES:
-                    if classify_ema_distance(distance_pct) is None:
-                        last_alert[coin][tf]["ema_strength"] = None
+                if tf in EMA_CLASSIFICATION_TIMEFRAMES and classify_ema_distance(distance_pct) is None:
+                    last_alert[coin][tf]["ema_strength"] = None
 
-                # ---------------- RSI ----------------
+                # ---------- RSI ----------
                 rsi = df["RSI"].iloc[-1]
                 rsi_signal = None
 
@@ -684,7 +714,7 @@ while True:
                 if rsi_signal is None:
                     last_alert[coin][tf]["rsi"] = None
 
-                # ---------------- BOLLINGER ----------------
+                # ---------- BOLLINGER ----------
                 upper = df["Upper"].iloc[-1]
                 lower = df["Lower"].iloc[-1]
                 width = upper - lower
@@ -719,20 +749,24 @@ while True:
                         f"Lower: {lower:.2f}"
                     )
 
-                    os.unlink(chart)
+                    try:
+                        os.unlink(chart)
+                    except OSError:
+                        pass
+
                     last_alert[coin][tf]["bb"] = bb_signal
 
                 if bb_signal is None:
                     last_alert[coin][tf]["bb"] = None
 
-                # ---------------- GIANT CANDLE ----------------
+                # ---------- GIANT CANDLE ----------
                 current_body = df["body_size"].iloc[-1]
                 avg_body = df["avg_body_size"].iloc[-2] if len(df) > 21 else None
 
                 candle_signal = None
                 multiplier = None
 
-                if avg_body and avg_body > 0:
+                if avg_body is not None and avg_body > 0:
                     ratio = current_body / avg_body
                     ratio_int = int(round(ratio))
 
@@ -756,7 +790,11 @@ while True:
                         f"Price: {price:.2f}"
                     )
 
-                    os.unlink(chart)
+                    try:
+                        os.unlink(chart)
+                    except OSError:
+                        pass
+
                     last_alert[coin][tf]["candle"] = candle_signal
 
                 if candle_signal is None:
