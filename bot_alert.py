@@ -18,9 +18,12 @@ TELEGRAM_URL = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
 coins = pd.read_csv("coins.csv")
 
 # Defaults if missing
-coins["bollinger_k"] = coins.get("bollinger_k", 2)
-coins["band_expand"] = coins.get("band_expand", 50)
-coins["band_shrink"] = coins.get("band_shrink", 10)
+if "bollinger_k" not in coins.columns:
+    coins["bollinger_k"] = 2
+if "band_expand" not in coins.columns:
+    coins["band_expand"] = 50
+if "band_shrink" not in coins.columns:
+    coins["band_shrink"] = 10
 
 timeframes = ["1", "5", "15", "60"]
 
@@ -36,8 +39,8 @@ last_alert = {
 def send_alert(msg):
     try:
         requests.get(TELEGRAM_URL, params={"chat_id": CHAT_ID, "text": msg}, timeout=10)
-    except:
-        pass
+    except Exception as e:
+        print("Telegram error:", e)
 
 # ----------------- Get Prices -----------------
 def get_prices(symbol, interval):
@@ -51,11 +54,11 @@ def get_prices(symbol, interval):
     except:
         return None
 
-# ----------------- Manual Check -----------------
+# ----------------- Manual Check (SENDS TO TELEGRAM) -----------------
 def check_bollinger_width(coin, tf):
     prices = get_prices(coin, tf)
     if not prices:
-        print("No data")
+        send_alert(f"{coin} {tf}m ❌ No data")
         return
 
     df = pd.DataFrame(prices, columns=["close"])
@@ -65,33 +68,41 @@ def check_bollinger_width(coin, tf):
     upper = (sma + 2 * std).iloc[-1]
     lower = (sma - 2 * std).iloc[-1]
     width = upper - lower
+    price = df["close"].iloc[-1]
 
-    print(f"\n📊 {coin} | {tf}m")
-    print(f"Price: {df['close'].iloc[-1]:.2f}")
-    print(f"Width: {width:.2f}")
-    print(f"Upper: {upper:.2f}")
-    print(f"Lower: {lower:.2f}\n")
+    message = (
+        f"📊 {coin} | {tf}m\n"
+        f"Manual Bollinger Check\n"
+        f"Price: {price:.2f}\n"
+        f"Width: {width:.2f}\n"
+        f"Upper: {upper:.2f}\n"
+        f"Lower: {lower:.2f}"
+    )
 
-# ----------------- Summary -----------------
+    send_alert(message)
+
+# ----------------- Summary (SENDS TO TELEGRAM) -----------------
 def show_summary(tf):
-    print(f"\n--- SUMMARY {tf}m ---")
+    message = f"📊 Bollinger Summary | {tf}m\n"
+
     for _, row in coins.iterrows():
         coin = row["coin"]
         prices = get_prices(coin, tf)
+
         if not prices:
-            print(f"{coin}: no data")
+            message += f"{coin}: no data\n"
             continue
 
         df = pd.DataFrame(prices, columns=["close"])
         sma = df["close"].rolling(20).mean()
         std = df["close"].rolling(20).std()
 
-        upper = (sma + 2 * std).iloc[-1]
-        lower = (sma - 2 * std).iloc[-1]
-        width = upper - lower
+        width = (sma + 2*std).iloc[-1] - (sma - 2*std).iloc[-1]
+        price = df["close"].iloc[-1]
 
-        print(f"{coin} | {df['close'].iloc[-1]:.2f} | width: {width:.2f}")
-    print("-------------------\n")
+        message += f"{coin} | {price:.2f} | W: {width:.2f}\n"
+
+    send_alert(message)
 
 # ----------------- Manual Input Thread -----------------
 def manual_input():
@@ -116,7 +127,7 @@ def manual_input():
 threading.Thread(target=manual_input, daemon=True).start()
 
 # ----------------- Start -----------------
-send_alert("🚨 BOT STARTED: EMA + RSI + BB 🚨")
+send_alert("🚨 BOT STARTED: EMA + RSI + BB + Manual Check 🚨")
 
 # ----------------- MAIN LOOP -----------------
 while True:
