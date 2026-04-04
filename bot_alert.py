@@ -17,17 +17,19 @@ TELEGRAM_URL = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
 # ----------------- Load coins -----------------
 coins = pd.read_csv("coins.csv")
 
-# Defaults
+# Defaults if missing
 coins["bollinger_k"] = coins.get("bollinger_k", 2)
 coins["band_expand"] = coins.get("band_expand", 50)
 coins["band_shrink"] = coins.get("band_shrink", 10)
 
 timeframes = ["1", "5", "15", "60"]
 
-# ----------------- Track alerts -----------------
+# ----------------- Track alerts (ANTI-SPAM) -----------------
 last_alert = {
-    coin: {tf: {"ema": None, "rsi": None, "bb": None} for tf in timeframes}
-    for coin in coins["coin"]
+    coin: {
+        tf: {"ema": None, "rsi": None, "bb": None}
+        for tf in timeframes
+    } for coin in coins["coin"]
 }
 
 # ----------------- Telegram -----------------
@@ -42,7 +44,7 @@ def get_prices(symbol, interval):
     url = "https://api.bybit.com/v5/market/kline"
     params = {"category": "linear", "symbol": symbol, "interval": interval, "limit": 200}
     try:
-        data = requests.get(url, params=params).json()
+        data = requests.get(url, params=params, timeout=10).json()
         closes = [float(i[4]) for i in data["result"]["list"]]
         closes.reverse()
         return closes
@@ -60,15 +62,15 @@ def check_bollinger_width(coin, tf):
     sma = df["close"].rolling(20).mean()
     std = df["close"].rolling(20).std()
 
-    upper = sma + 2 * std
-    lower = sma - 2 * std
-    width = upper.iloc[-1] - lower.iloc[-1]
+    upper = (sma + 2 * std).iloc[-1]
+    lower = (sma - 2 * std).iloc[-1]
+    width = upper - lower
 
-    print(f"\n{coin} | {tf}m")
+    print(f"\n📊 {coin} | {tf}m")
     print(f"Price: {df['close'].iloc[-1]:.2f}")
     print(f"Width: {width:.2f}")
-    print(f"Upper: {upper.iloc[-1]:.2f}")
-    print(f"Lower: {lower.iloc[-1]:.2f}\n")
+    print(f"Upper: {upper:.2f}")
+    print(f"Lower: {lower:.2f}\n")
 
 # ----------------- Summary -----------------
 def show_summary(tf):
@@ -84,7 +86,10 @@ def show_summary(tf):
         sma = df["close"].rolling(20).mean()
         std = df["close"].rolling(20).std()
 
-        width = (sma + 2*std).iloc[-1] - (sma - 2*std).iloc[-1]
+        upper = (sma + 2 * std).iloc[-1]
+        lower = (sma - 2 * std).iloc[-1]
+        width = upper - lower
+
         print(f"{coin} | {df['close'].iloc[-1]:.2f} | width: {width:.2f}")
     print("-------------------\n")
 
@@ -111,7 +116,7 @@ def manual_input():
 threading.Thread(target=manual_input, daemon=True).start()
 
 # ----------------- Start -----------------
-send_alert("🚨 BOT STARTED 🚨")
+send_alert("🚨 BOT STARTED: EMA + RSI + BB 🚨")
 
 # ----------------- MAIN LOOP -----------------
 while True:
@@ -131,43 +136,80 @@ while True:
                     continue
 
                 df = pd.DataFrame(prices, columns=["close"])
-
-                # EMA
-                df["EMA"] = df["close"].ewm(span=200).mean()
                 price = df["close"].iloc[-1]
+
+                # -------- EMA --------
+                df["EMA"] = df["close"].ewm(span=200).mean()
                 ema = df["EMA"].iloc[-1]
 
-                if price > ema*(1+percent/100):
-                    if last_alert[coin][tf]["ema"] != "above":
-                        send_alert(f"{coin} {tf}m EMA ABOVE 🚀")
-                        last_alert[coin][tf]["ema"] = "above"
+                ema_signal = None
+                if price > ema * (1 + percent / 100):
+                    ema_signal = "above"
+                elif price < ema * (1 - percent / 100):
+                    ema_signal = "below"
 
-                elif price < ema*(1-percent/100):
-                    if last_alert[coin][tf]["ema"] != "below":
-                        send_alert(f"{coin} {tf}m EMA BELOW 🔻")
-                        last_alert[coin][tf]["ema"] = "below"
+                if ema_signal and last_alert[coin][tf]["ema"] != ema_signal:
+                    send_alert(
+                        f"📊 {coin} | {tf}m\n"
+                        f"EMA {'BREAKOUT 🚀' if ema_signal=='above' else 'BREAKDOWN 🔻'}\n"
+                        f"Price: {price:.2f}\nEMA: {ema:.2f}"
+                    )
+                    last_alert[coin][tf]["ema"] = ema_signal
 
-                # RSI
+                if ema_signal is None:
+                    last_alert[coin][tf]["ema"] = None
+
+                # -------- RSI --------
                 delta = df["close"].diff()
                 gain = delta.clip(lower=0).rolling(14).mean()
                 loss = -delta.clip(upper=0).rolling(14).mean()
                 rs = gain / loss.replace(0, 1e-10)
-                rsi = 100 - (100/(1+rs)).iloc[-1]
+                rsi = 100 - (100 / (1 + rs)).iloc[-1]
 
+                rsi_signal = None
                 if abs(rsi - rsi_high) < 0.5:
-                    send_alert(f"{coin} {tf}m RSI ~{rsi_high}")
+                    rsi_signal = "overbought"
                 elif abs(rsi - rsi_low) < 0.5:
-                    send_alert(f"{coin} {tf}m RSI ~{rsi_low}")
+                    rsi_signal = "oversold"
 
-                # Bollinger
+                if rsi_signal and last_alert[coin][tf]["rsi"] != rsi_signal:
+                    send_alert(
+                        f"📊 {coin} | {tf}m\n"
+                        f"RSI HIT {'OVERBOUGHT 🔴' if rsi_signal=='overbought' else 'OVERSOLD 🟢'}\n"
+                        f"RSI: {rsi:.2f}\nPrice: {price:.2f}"
+                    )
+                    last_alert[coin][tf]["rsi"] = rsi_signal
+
+                if rsi_signal is None:
+                    last_alert[coin][tf]["rsi"] = None
+
+                # -------- BOLLINGER --------
                 sma = df["close"].rolling(20).mean()
                 std = df["close"].rolling(20).std()
-                width = (sma+2*std).iloc[-1] - (sma-2*std).iloc[-1]
 
+                upper = (sma + 2 * std).iloc[-1]
+                lower = (sma - 2 * std).iloc[-1]
+                width = upper - lower
+
+                bb_signal = None
                 if width > expand:
-                    send_alert(f"{coin} {tf}m BB EXPANSION 📈")
+                    bb_signal = "expand"
                 elif width < shrink:
-                    send_alert(f"{coin} {tf}m BB SQUEEZE 🔥")
+                    bb_signal = "shrink"
+
+                if bb_signal and last_alert[coin][tf]["bb"] != bb_signal:
+                    send_alert(
+                        f"📊 {coin} | {tf}m\n"
+                        f"Bollinger {'EXPANSION 📈' if bb_signal=='expand' else 'SQUEEZE 🔥'}\n"
+                        f"Width: {width:.2f}\n"
+                        f"Price: {price:.2f}\n"
+                        f"Upper: {upper:.2f}\n"
+                        f"Lower: {lower:.2f}"
+                    )
+                    last_alert[coin][tf]["bb"] = bb_signal
+
+                if bb_signal is None:
+                    last_alert[coin][tf]["bb"] = None
 
         time.sleep(60)
 
