@@ -22,7 +22,6 @@ RSI_OVERSOLD = 10
 RSI_TOLERANCE = 0.3
 
 # ---------------- EMA DISTANCE CLASSIFICATION ----------------
-# Applies only to 5m, 15m, 60m
 EMA_CLASSIFICATION_TIMEFRAMES = {"5", "15", "60"}
 
 EMA_STRONG_MIN = 4.0
@@ -55,7 +54,6 @@ for col in required_cols:
         coins[col] = None
 
 coins = coins[required_cols]
-
 timeframes = ["1", "5", "15", "60"]
 
 # ---------------- SAVE ----------------
@@ -275,7 +273,6 @@ def check_bollinger_width(coin: str, tf: str):
     lower = df["Lower"].iloc[-1]
     width = upper - lower
     price = df["close"].iloc[-1]
-    rsi = df["RSI"].iloc[-1]
     ema = df["EMA"].iloc[-1]
     distance = ema_distance_percent(price, ema)
 
@@ -293,7 +290,6 @@ def check_bollinger_width(coin: str, tf: str):
         f"EMA Distance: {distance:.2f}%\n"
         f"{strength_line}"
         f"Width: {width:.2f}\n"
-        f"RSI: {rsi:.2f}\n"
         f"Upper: {upper:.2f}\n"
         f"Lower: {lower:.2f}"
     )
@@ -312,14 +308,13 @@ def show_summary(tf: str):
         df = add_indicators(df)
         width = df["Upper"].iloc[-1] - df["Lower"].iloc[-1]
         price = df["close"].iloc[-1]
-        rsi = df["RSI"].iloc[-1]
         ema = df["EMA"].iloc[-1]
         distance = ema_distance_percent(price, ema)
 
         _level, _direction, strength_label = get_strength_details(distance, tf)
         strength_part = f" | S:{strength_label}" if strength_label else ""
 
-        msg += f"{coin} | P:{price:.2f} | D:{distance:.2f}%{strength_part} | W:{width:.2f} | RSI:{rsi:.2f}\n"
+        msg += f"{coin} | P:{price:.2f} | D:{distance:.2f}%{strength_part} | W:{width:.2f}\n"
 
     send_alert(msg)
 
@@ -558,9 +553,9 @@ while True:
 
                 bb_signal = None
                 if width > expand:
-                    bb_signal = "expand"
+                    bb_signal = "wide"
                 elif width < shrink:
-                    bb_signal = "shrink"
+                    bb_signal = "tight"
 
                 if bb_signal and last_alert[coin][tf]["bb"] != bb_signal:
                     chart = plot_standard_chart(df, coin, tf)
@@ -577,14 +572,13 @@ while True:
                     send_image(
                         chart,
                         f"📊 {coin} | {tf}m\n"
-                        f"Bollinger {'EXPANSION 📈' if bb_signal == 'expand' else 'SQUEEZE 🔥'}\n"
+                        f"Bollinger Alert\n"
                         f"{strength_line}"
                         f"Width: {width:.2f}\n"
                         f"Price: {price:.2f}\n"
                         f"EMA Distance: {distance_pct:.2f}%\n"
                         f"Upper: {upper:.2f}\n"
-                        f"Lower: {lower:.2f}\n"
-                        f"RSI: {rsi:.2f}"
+                        f"Lower: {lower:.2f}"
                     )
 
                     os.unlink(chart)
