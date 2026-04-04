@@ -12,14 +12,21 @@ CHAT_ID = os.getenv("CHAT_ID")
 
 if not TOKEN or not CHAT_ID:
     print("Missing TOKEN or CHAT_ID")
-    exit()
+    raise SystemExit
 
 TELEGRAM_URL = f"https://api.telegram.org/bot{TOKEN}"
 
 # ---------------- FIXED RSI SETTINGS ----------------
 RSI_OVERBOUGHT = 90
 RSI_OVERSOLD = 10
-RSI_TOLERANCE = 0.3  # same zone-style logic
+RSI_TOLERANCE = 0.3
+
+# ---------------- EMA DISTANCE CLASSIFICATION ----------------
+EMA_CLASSIFICATION_TIMEFRAMES = {"5", "15", "60"}
+
+EMA_STRONG_MIN = 4.0
+EMA_VERY_STRONG_MIN = 6.0
+EMA_OVERSTRETCHED_MIN = 10.0
 
 # ---------------- LOAD COINS ----------------
 FILE = "coins.csv"
@@ -32,18 +39,15 @@ except Exception:
         "band_expand", "band_shrink"
     ])
 
-# Keep compatibility with older CSVs
 if "band_expand" not in coins.columns:
     coins["band_expand"] = 50
 if "band_shrink" not in coins.columns:
     coins["band_shrink"] = 10
 
-# Drop old RSI columns if they exist; fixed RSI is now global
 for col in ["rsi_overbought", "rsi_oversold"]:
     if col in coins.columns:
         coins = coins.drop(columns=[col])
 
-# Normalize required columns
 required_cols = ["coin", "percent", "direction", "band_expand", "band_shrink"]
 for col in required_cols:
     if col not in coins.columns:
@@ -60,10 +64,11 @@ def save_coins():
 # ---------------- TRACKING ----------------
 last_alert = {}
 
-def init_coin_tracking(coin):
+def init_coin_tracking(coin: str):
     last_alert[coin] = {
         tf: {
             "ema": None,
+            "ema_strength": None,
             "rsi": None,
             "bb": None,
             "candle": None
@@ -75,7 +80,7 @@ for c in coins["coin"].dropna():
     init_coin_tracking(str(c).upper())
 
 # ---------------- TELEGRAM SEND ----------------
-def send_alert(msg):
+def send_alert(msg: str):
     try:
         requests.get(
             f"{TELEGRAM_URL}/sendMessage",
@@ -85,7 +90,7 @@ def send_alert(msg):
     except Exception as e:
         print("send_alert error:", e)
 
-def send_image(path, caption):
+def send_image(path: str, caption: str):
     try:
         with open(path, "rb") as img:
             requests.post(
@@ -98,7 +103,7 @@ def send_image(path, caption):
         print("send_image error:", e)
 
 # ---------------- GET DATA ----------------
-def get_ohlc(symbol, interval):
+def get_ohlc(symbol: str, interval: str):
     try:
         r = requests.get(
             "https://api.bybit.com/v5/market/kline",
@@ -132,33 +137,58 @@ def get_ohlc(symbol, interval):
         return None
 
 # ---------------- INDICATORS ----------------
-def add_indicators(df):
+def add_indicators(df: pd.DataFrame):
     df = df.copy()
 
-    # EMA
     df["EMA"] = df["close"].ewm(span=200, adjust=False).mean()
 
-    # Bollinger
     df["SMA20"] = df["close"].rolling(20).mean()
     df["STD20"] = df["close"].rolling(20).std()
     df["Upper"] = df["SMA20"] + 2 * df["STD20"]
     df["Lower"] = df["SMA20"] - 2 * df["STD20"]
 
-    # RSI
     delta = df["close"].diff()
     gain = delta.clip(lower=0).rolling(14).mean()
     loss = -delta.clip(upper=0).rolling(14).mean()
     rs = gain / loss.replace(0, 1e-10)
     df["RSI"] = 100 - (100 / (1 + rs))
 
-    # Candle body
     df["body_size"] = (df["close"] - df["open"]).abs()
     df["avg_body_size"] = df["body_size"].rolling(20).mean()
 
     return df
 
+# ---------------- HELPERS ----------------
+def ema_distance_percent(price: float, ema: float) -> float:
+    if ema == 0:
+        return 0.0
+    return ((price - ema) / ema) * 100
+
+def classify_ema_distance(distance_pct: float):
+    abs_dist = abs(distance_pct)
+
+    if abs_dist >= EMA_OVERSTRETCHED_MIN:
+        return "overstretched"
+    if abs_dist >= EMA_VERY_STRONG_MIN:
+        return "very_strong"
+    if abs_dist >= EMA_STRONG_MIN:
+        return "strong"
+    return None
+
+def classify_direction(distance_pct: float) -> str:
+    return "above" if distance_pct > 0 else "below"
+
+def format_strength_label(level: str) -> str:
+    if level == "strong":
+        return "STRONG"
+    if level == "very_strong":
+        return "VERY STRONG"
+    if level == "overstretched":
+        return "OVERSTRETCHED"
+    return "NORMAL"
+
 # ---------------- CHARTS ----------------
-def plot_standard_chart(df, coin, tf):
+def plot_standard_chart(df: pd.DataFrame, coin: str, tf: str):
     df = add_indicators(df)
 
     fig, (ax1, ax2) = plt.subplots(
@@ -186,7 +216,7 @@ def plot_standard_chart(df, coin, tf):
     plt.close()
     return tmp.name
 
-def plot_giant_candle_chart(df, coin, tf):
+def plot_giant_candle_chart(df: pd.DataFrame, coin: str, tf: str):
     df = add_indicators(df)
 
     fig, (ax1, ax2) = plt.subplots(
@@ -219,7 +249,7 @@ def plot_giant_candle_chart(df, coin, tf):
     return tmp.name
 
 # ---------------- COMMANDS ----------------
-def check_bollinger_width(coin, tf):
+def check_bollinger_width(coin: str, tf: str):
     df = get_ohlc(coin, tf)
     if df is None or len(df) < 20:
         send_alert(f"{coin} {tf}m ❌ No data")
@@ -233,12 +263,15 @@ def check_bollinger_width(coin, tf):
     width = upper - lower
     price = df["close"].iloc[-1]
     rsi = df["RSI"].iloc[-1]
+    ema = df["EMA"].iloc[-1]
+    distance = ema_distance_percent(price, ema)
 
     send_image(
         chart,
         f"📊 {coin} | {tf}m\n"
         f"Manual Check\n"
         f"Price: {price:.2f}\n"
+        f"EMA Distance: {distance:.2f}%\n"
         f"Width: {width:.2f}\n"
         f"RSI: {rsi:.2f}\n"
         f"Upper: {upper:.2f}\n"
@@ -247,7 +280,7 @@ def check_bollinger_width(coin, tf):
 
     os.unlink(chart)
 
-def show_summary(tf):
+def show_summary(tf: str):
     msg = f"📊 Summary {tf}m\nRSI Zones: {RSI_OVERBOUGHT}/{RSI_OVERSOLD}\n"
     for _, r in coins.iterrows():
         coin = r["coin"]
@@ -260,8 +293,10 @@ def show_summary(tf):
         width = df["Upper"].iloc[-1] - df["Lower"].iloc[-1]
         price = df["close"].iloc[-1]
         rsi = df["RSI"].iloc[-1]
+        ema = df["EMA"].iloc[-1]
+        distance = ema_distance_percent(price, ema)
 
-        msg += f"{coin} | P:{price:.2f} | W:{width:.2f} | RSI:{rsi:.2f}\n"
+        msg += f"{coin} | P:{price:.2f} | D:{distance:.2f}% | W:{width:.2f} | RSI:{rsi:.2f}\n"
 
     send_alert(msg)
 
@@ -295,20 +330,14 @@ def telegram_listener():
                 if len(parts) == 0:
                     continue
 
-                # ADD
                 if parts[0] == "/add" and len(parts) == 2:
                     data = parts[1].split(",")
 
-                    # New format: coin,percent,direction,band_expand,band_shrink
-                    if len(data) == 5:
-                        coin, p, d, be, bs = data
-                    # Old format supported: coin,percent,direction,rsi_high,rsi_low,band_expand,band_shrink
-                    elif len(data) == 7:
-                        coin, p, d, _old_rh, _old_rl, be, bs = data
-                    else:
+                    if len(data) != 5:
                         send_alert("❌ Format:\n/add BTCUSDT,2,both,50,10")
                         continue
 
+                    coin, p, d, be, bs = data
                     coin = coin.upper()
 
                     if coin in coins["coin"].values:
@@ -323,7 +352,6 @@ def telegram_listener():
                     init_coin_tracking(coin)
                     send_alert(f"✅ {coin} added\nRSI fixed at {RSI_OVERBOUGHT}/{RSI_OVERSOLD}")
 
-                # REMOVE
                 elif parts[0] == "/remove" and len(parts) == 2:
                     coin = parts[1].upper()
                     coins = coins[coins["coin"] != coin]
@@ -334,7 +362,6 @@ def telegram_listener():
 
                     send_alert(f"❌ {coin} removed")
 
-                # LIST
                 elif parts[0] == "/list":
                     if coins.empty:
                         send_alert("⚠️ No coins in list")
@@ -348,11 +375,9 @@ def telegram_listener():
                             )
                         send_alert(msg)
 
-                # CHECK
                 elif parts[0] == "/check" and len(parts) == 3:
                     check_bollinger_width(parts[1].upper(), parts[2])
 
-                # SUMMARY
                 elif parts[0] == "/summary" and len(parts) == 2:
                     show_summary(parts[1])
 
@@ -375,7 +400,11 @@ def telegram_listener():
 threading.Thread(target=telegram_listener, daemon=True).start()
 
 # ---------------- START ----------------
-send_alert(f"🚨 FULL BOT RUNNING\nRSI fixed at {RSI_OVERBOUGHT}/{RSI_OVERSOLD} 🚨")
+send_alert(
+    f"🚨 FULL BOT RUNNING 🚨\n"
+    f"RSI fixed at {RSI_OVERBOUGHT}/{RSI_OVERSOLD}\n"
+    f"EMA strength alerts active on 5m / 15m / 60m"
+)
 
 # ---------------- MAIN LOOP ----------------
 while True:
@@ -396,6 +425,7 @@ while True:
 
                 price = df["close"].iloc[-1]
                 ema = df["EMA"].iloc[-1]
+                distance_pct = ema_distance_percent(price, ema)
 
                 # ---------------- EMA ----------------
                 ema_signal = None
@@ -421,6 +451,7 @@ while True:
                             f"EMA ABOVE 🚀\n"
                             f"Price: {price:.2f}\n"
                             f"EMA: {ema:.2f}\n"
+                            f"Distance: {distance_pct:.2f}%\n"
                             f"Threshold: {threshold_above:.2f}"
                         )
                     else:
@@ -429,12 +460,42 @@ while True:
                             f"EMA BELOW 🔻\n"
                             f"Price: {price:.2f}\n"
                             f"EMA: {ema:.2f}\n"
+                            f"Distance: {distance_pct:.2f}%\n"
                             f"Threshold: {threshold_below:.2f}"
                         )
                     last_alert[coin][tf]["ema"] = ema_signal
 
                 if threshold_below <= price <= threshold_above:
                     last_alert[coin][tf]["ema"] = None
+
+                # ---------------- EMA DISTANCE STRENGTH ----------------
+                strength_signal = None
+                strength_direction = None
+
+                if tf in EMA_CLASSIFICATION_TIMEFRAMES:
+                    strength_level = classify_ema_distance(distance_pct)
+                    if strength_level:
+                        strength_direction = classify_direction(distance_pct)
+                        strength_signal = f"{strength_direction}_{strength_level}"
+
+                if strength_signal and last_alert[coin][tf]["ema_strength"] != strength_signal:
+                    level = strength_signal.split("_", 1)[1]
+                    direction_text = "ABOVE EMA 🚀" if strength_direction == "above" else "BELOW EMA 🔻"
+
+                    send_alert(
+                        f"📊 {coin} | {tf}m\n"
+                        f"EMA DISTANCE ALERT\n"
+                        f"Strength: {format_strength_label(level)}\n"
+                        f"Direction: {direction_text}\n"
+                        f"Distance: {distance_pct:.2f}%\n"
+                        f"Price: {price:.2f}\n"
+                        f"EMA: {ema:.2f}"
+                    )
+                    last_alert[coin][tf]["ema_strength"] = strength_signal
+
+                if tf in EMA_CLASSIFICATION_TIMEFRAMES:
+                    if classify_ema_distance(distance_pct) is None:
+                        last_alert[coin][tf]["ema_strength"] = None
 
                 # ---------------- RSI ----------------
                 rsi = df["RSI"].iloc[-1]
@@ -487,6 +548,7 @@ while True:
                         f"Bollinger {'EXPANSION 📈' if bb_signal == 'expand' else 'SQUEEZE 🔥'}\n"
                         f"Width: {width:.2f}\n"
                         f"Price: {price:.2f}\n"
+                        f"EMA Distance: {distance_pct:.2f}%\n"
                         f"Upper: {upper:.2f}\n"
                         f"Lower: {lower:.2f}\n"
                         f"RSI: {rsi:.2f}"
