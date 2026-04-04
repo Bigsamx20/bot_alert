@@ -16,6 +16,11 @@ if not TOKEN or not CHAT_ID:
 
 TELEGRAM_URL = f"https://api.telegram.org/bot{TOKEN}"
 
+# ---------------- FIXED RSI SETTINGS ----------------
+RSI_OVERBOUGHT = 90
+RSI_OVERSOLD = 10
+RSI_TOLERANCE = 0.3  # same zone-style logic
+
 # ---------------- LOAD COINS ----------------
 FILE = "coins.csv"
 
@@ -24,9 +29,27 @@ try:
 except Exception:
     coins = pd.DataFrame(columns=[
         "coin", "percent", "direction",
-        "rsi_overbought", "rsi_oversold",
         "band_expand", "band_shrink"
     ])
+
+# Keep compatibility with older CSVs
+if "band_expand" not in coins.columns:
+    coins["band_expand"] = 50
+if "band_shrink" not in coins.columns:
+    coins["band_shrink"] = 10
+
+# Drop old RSI columns if they exist; fixed RSI is now global
+for col in ["rsi_overbought", "rsi_oversold"]:
+    if col in coins.columns:
+        coins = coins.drop(columns=[col])
+
+# Normalize required columns
+required_cols = ["coin", "percent", "direction", "band_expand", "band_shrink"]
+for col in required_cols:
+    if col not in coins.columns:
+        coins[col] = None
+
+coins = coins[required_cols]
 
 timeframes = ["1", "5", "15", "60"]
 
@@ -48,8 +71,8 @@ def init_coin_tracking(coin):
         for tf in timeframes
     }
 
-for c in coins["coin"]:
-    init_coin_tracking(c)
+for c in coins["coin"].dropna():
+    init_coin_tracking(str(c).upper())
 
 # ---------------- TELEGRAM SEND ----------------
 def send_alert(msg):
@@ -81,7 +104,7 @@ def get_ohlc(symbol, interval):
             "https://api.bybit.com/v5/market/kline",
             params={
                 "category": "linear",
-                "symbol": symbol,
+                "symbol": symbol.upper(),
                 "interval": interval,
                 "limit": 200
             },
@@ -93,7 +116,7 @@ def get_ohlc(symbol, interval):
             return None
 
         rows = data["result"]["list"]
-        rows.reverse()  # oldest -> newest
+        rows.reverse()
 
         df = pd.DataFrame(rows, columns=[
             "start_time", "open", "high", "low", "close",
@@ -128,7 +151,7 @@ def add_indicators(df):
     rs = gain / loss.replace(0, 1e-10)
     df["RSI"] = 100 - (100 / (1 + rs))
 
-    # Candle body size
+    # Candle body
     df["body_size"] = (df["close"] - df["open"]).abs()
     df["avg_body_size"] = df["body_size"].rolling(20).mean()
 
@@ -152,8 +175,8 @@ def plot_standard_chart(df, coin, tf):
     ax1.legend()
 
     ax2.plot(df.index, df["RSI"], label="RSI")
-    ax2.axhline(90, linestyle="--")
-    ax2.axhline(10, linestyle="--")
+    ax2.axhline(RSI_OVERBOUGHT, linestyle="--")
+    ax2.axhline(RSI_OVERSOLD, linestyle="--")
     ax2.set_ylim(0, 100)
     ax2.legend()
 
@@ -184,8 +207,8 @@ def plot_giant_candle_chart(df, coin, tf):
     ax1.legend()
 
     ax2.plot(df.index, df["RSI"], label="RSI")
-    ax2.axhline(90, linestyle="--")
-    ax2.axhline(10, linestyle="--")
+    ax2.axhline(RSI_OVERBOUGHT, linestyle="--")
+    ax2.axhline(RSI_OVERSOLD, linestyle="--")
     ax2.set_ylim(0, 100)
     ax2.legend()
 
@@ -209,6 +232,7 @@ def check_bollinger_width(coin, tf):
     lower = df["Lower"].iloc[-1]
     width = upper - lower
     price = df["close"].iloc[-1]
+    rsi = df["RSI"].iloc[-1]
 
     send_image(
         chart,
@@ -216,6 +240,7 @@ def check_bollinger_width(coin, tf):
         f"Manual Check\n"
         f"Price: {price:.2f}\n"
         f"Width: {width:.2f}\n"
+        f"RSI: {rsi:.2f}\n"
         f"Upper: {upper:.2f}\n"
         f"Lower: {lower:.2f}"
     )
@@ -223,7 +248,7 @@ def check_bollinger_width(coin, tf):
     os.unlink(chart)
 
 def show_summary(tf):
-    msg = f"📊 Summary {tf}m\n"
+    msg = f"📊 Summary {tf}m\nRSI Zones: {RSI_OVERBOUGHT}/{RSI_OVERSOLD}\n"
     for _, r in coins.iterrows():
         coin = r["coin"]
         df = get_ohlc(coin, tf)
@@ -234,8 +259,9 @@ def show_summary(tf):
         df = add_indicators(df)
         width = df["Upper"].iloc[-1] - df["Lower"].iloc[-1]
         price = df["close"].iloc[-1]
+        rsi = df["RSI"].iloc[-1]
 
-        msg += f"{coin} | P:{price:.2f} | W:{width:.2f}\n"
+        msg += f"{coin} | P:{price:.2f} | W:{width:.2f} | RSI:{rsi:.2f}\n"
 
     send_alert(msg)
 
@@ -273,11 +299,16 @@ def telegram_listener():
                 if parts[0] == "/add" and len(parts) == 2:
                     data = parts[1].split(",")
 
-                    if len(data) != 7:
-                        send_alert("❌ Format:\n/add BTCUSDT,2,both,90,10,50,10")
+                    # New format: coin,percent,direction,band_expand,band_shrink
+                    if len(data) == 5:
+                        coin, p, d, be, bs = data
+                    # Old format supported: coin,percent,direction,rsi_high,rsi_low,band_expand,band_shrink
+                    elif len(data) == 7:
+                        coin, p, d, _old_rh, _old_rl, be, bs = data
+                    else:
+                        send_alert("❌ Format:\n/add BTCUSDT,2,both,50,10")
                         continue
 
-                    coin, p, d, rh, rl, be, bs = data
                     coin = coin.upper()
 
                     if coin in coins["coin"].values:
@@ -285,12 +316,12 @@ def telegram_listener():
                         continue
 
                     coins.loc[len(coins)] = [
-                        coin, float(p), d, float(rh), float(rl), float(be), float(bs)
+                        coin, float(p), d.lower(), float(be), float(bs)
                     ]
 
                     save_coins()
                     init_coin_tracking(coin)
-                    send_alert(f"✅ {coin} added")
+                    send_alert(f"✅ {coin} added\nRSI fixed at {RSI_OVERBOUGHT}/{RSI_OVERSOLD}")
 
                 # REMOVE
                 elif parts[0] == "/remove" and len(parts) == 2:
@@ -308,7 +339,14 @@ def telegram_listener():
                     if coins.empty:
                         send_alert("⚠️ No coins in list")
                     else:
-                        send_alert("\n".join(coins["coin"]))
+                        msg = f"📋 Coins\nRSI fixed: {RSI_OVERBOUGHT}/{RSI_OVERSOLD}\n"
+                        for _, r in coins.iterrows():
+                            msg += (
+                                f"{r['coin']} | EMA:{r['percent']}% | "
+                                f"Dir:{r['direction']} | "
+                                f"BB:{r['band_expand']}/{r['band_shrink']}\n"
+                            )
+                        send_alert(msg)
 
                 # CHECK
                 elif parts[0] == "/check" and len(parts) == 3:
@@ -321,11 +359,12 @@ def telegram_listener():
                 else:
                     send_alert(
                         "Commands:\n"
-                        "/add BTCUSDT,2,both,90,10,50,10\n"
+                        "/add BTCUSDT,2,both,50,10\n"
                         "/remove BTCUSDT\n"
                         "/list\n"
                         "/check BTCUSDT 5\n"
-                        "/summary 5"
+                        "/summary 5\n\n"
+                        f"RSI is fixed at {RSI_OVERBOUGHT}/{RSI_OVERSOLD}"
                     )
 
         except Exception as e:
@@ -336,7 +375,7 @@ def telegram_listener():
 threading.Thread(target=telegram_listener, daemon=True).start()
 
 # ---------------- START ----------------
-send_alert("🚨 FULL BOT RUNNING WITH GIANT CANDLE ALERTS 🚨")
+send_alert(f"🚨 FULL BOT RUNNING\nRSI fixed at {RSI_OVERBOUGHT}/{RSI_OVERSOLD} 🚨")
 
 # ---------------- MAIN LOOP ----------------
 while True:
@@ -345,8 +384,6 @@ while True:
             coin = row["coin"]
             percent = float(row["percent"])
             direction = str(row["direction"]).lower()
-            rsi_high = float(row["rsi_overbought"])
-            rsi_low = float(row["rsi_oversold"])
             expand = float(row["band_expand"])
             shrink = float(row["band_shrink"])
 
@@ -362,7 +399,6 @@ while True:
 
                 # ---------------- EMA ----------------
                 ema_signal = None
-
                 threshold_above = ema * (1 + percent / 100)
                 threshold_below = ema * (1 - percent / 100)
 
@@ -404,9 +440,9 @@ while True:
                 rsi = df["RSI"].iloc[-1]
                 rsi_signal = None
 
-                if abs(rsi - rsi_high) < 0.3:
+                if abs(rsi - RSI_OVERBOUGHT) < RSI_TOLERANCE:
                     rsi_signal = "high"
-                elif abs(rsi - rsi_low) < 0.3:
+                elif abs(rsi - RSI_OVERSOLD) < RSI_TOLERANCE:
                     rsi_signal = "low"
 
                 if rsi_signal and last_alert[coin][tf]["rsi"] != rsi_signal:
@@ -415,6 +451,7 @@ while True:
                             f"📊 {coin} | {tf}m\n"
                             f"RSI OVERBOUGHT 🔴\n"
                             f"RSI: {rsi:.2f}\n"
+                            f"Zone: {RSI_OVERBOUGHT} ± {RSI_TOLERANCE}\n"
                             f"Price: {price:.2f}"
                         )
                     else:
@@ -422,6 +459,7 @@ while True:
                             f"📊 {coin} | {tf}m\n"
                             f"RSI OVERSOLD 🟢\n"
                             f"RSI: {rsi:.2f}\n"
+                            f"Zone: {RSI_OVERSOLD} ± {RSI_TOLERANCE}\n"
                             f"Price: {price:.2f}"
                         )
                     last_alert[coin][tf]["rsi"] = rsi_signal
@@ -450,7 +488,8 @@ while True:
                         f"Width: {width:.2f}\n"
                         f"Price: {price:.2f}\n"
                         f"Upper: {upper:.2f}\n"
-                        f"Lower: {lower:.2f}"
+                        f"Lower: {lower:.2f}\n"
+                        f"RSI: {rsi:.2f}"
                     )
 
                     os.unlink(chart)
