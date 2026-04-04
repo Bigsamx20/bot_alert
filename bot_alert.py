@@ -22,6 +22,7 @@ RSI_OVERSOLD = 10
 RSI_TOLERANCE = 0.3
 
 # ---------------- EMA DISTANCE CLASSIFICATION ----------------
+# Applies only to 5m, 15m, 60m
 EMA_CLASSIFICATION_TIMEFRAMES = {"5", "15", "60"}
 
 EMA_STRONG_MIN = 4.0
@@ -187,6 +188,18 @@ def format_strength_label(level: str) -> str:
         return "OVERSTRETCHED"
     return "NORMAL"
 
+def get_strength_details(distance_pct: float, tf: str):
+    if tf not in EMA_CLASSIFICATION_TIMEFRAMES:
+        return None, None, None
+
+    level = classify_ema_distance(distance_pct)
+    if not level:
+        return None, None, None
+
+    direction = classify_direction(distance_pct)
+    label = format_strength_label(level)
+    return level, direction, label
+
 # ---------------- CHARTS ----------------
 def plot_standard_chart(df: pd.DataFrame, coin: str, tf: str):
     df = add_indicators(df)
@@ -266,12 +279,19 @@ def check_bollinger_width(coin: str, tf: str):
     ema = df["EMA"].iloc[-1]
     distance = ema_distance_percent(price, ema)
 
+    _level, direction, strength_label = get_strength_details(distance, tf)
+    strength_line = ""
+    if strength_label:
+        direction_text = "ABOVE EMA 🚀" if direction == "above" else "BELOW EMA 🔻"
+        strength_line = f"Strength: {strength_label} ({direction_text})\n"
+
     send_image(
         chart,
         f"📊 {coin} | {tf}m\n"
         f"Manual Check\n"
         f"Price: {price:.2f}\n"
         f"EMA Distance: {distance:.2f}%\n"
+        f"{strength_line}"
         f"Width: {width:.2f}\n"
         f"RSI: {rsi:.2f}\n"
         f"Upper: {upper:.2f}\n"
@@ -296,7 +316,10 @@ def show_summary(tf: str):
         ema = df["EMA"].iloc[-1]
         distance = ema_distance_percent(price, ema)
 
-        msg += f"{coin} | P:{price:.2f} | D:{distance:.2f}% | W:{width:.2f} | RSI:{rsi:.2f}\n"
+        _level, _direction, strength_label = get_strength_details(distance, tf)
+        strength_part = f" | S:{strength_label}" if strength_label else ""
+
+        msg += f"{coin} | P:{price:.2f} | D:{distance:.2f}%{strength_part} | W:{width:.2f} | RSI:{rsi:.2f}\n"
 
     send_alert(msg)
 
@@ -542,10 +565,20 @@ while True:
                 if bb_signal and last_alert[coin][tf]["bb"] != bb_signal:
                     chart = plot_standard_chart(df, coin, tf)
 
+                    _level, bb_strength_direction, bb_strength_label = get_strength_details(distance_pct, tf)
+                    strength_line = ""
+                    if bb_strength_label:
+                        direction_text = "ABOVE EMA 🚀" if bb_strength_direction == "above" else "BELOW EMA 🔻"
+                        strength_line = (
+                            f"Strength: {bb_strength_label}\n"
+                            f"EMA Direction: {direction_text}\n"
+                        )
+
                     send_image(
                         chart,
                         f"📊 {coin} | {tf}m\n"
                         f"Bollinger {'EXPANSION 📈' if bb_signal == 'expand' else 'SQUEEZE 🔥'}\n"
+                        f"{strength_line}"
                         f"Width: {width:.2f}\n"
                         f"Price: {price:.2f}\n"
                         f"EMA Distance: {distance_pct:.2f}%\n"
