@@ -5,7 +5,7 @@ import requests
 import pandas as pd
 
 # =========================
-# TELEGRAM / GENERAL CONFIG
+# TELEGRAM / BOT SETTINGS
 # =========================
 TOKEN = os.getenv("TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -20,70 +20,54 @@ BYBIT_INSTRUMENTS_URL = "https://api.bybit.com/v5/market/instruments-info"
 # Only these timeframes
 TIMEFRAMES = ["5", "15", "60"]
 
-# Universal standard for all coins
-EXTREME_EMA_DISTANCE_PERCENT = 10.0
+# Extreme EMA distance standard for all coins
+EXTREME_EMA_DISTANCE_PERCENT = 15.0
 
-# Default settings for auto-fetched coins
-DEFAULT_PERCENT = 2.0
-DEFAULT_DIRECTION = "both"
-DEFAULT_BAND_EXPAND = 50.0
-DEFAULT_BAND_SHRINK = 10.0
+# Faster scan cycle
+SCAN_INTERVAL_SECONDS = 15
 
-# Files
-MANUAL_COINS_FILE = "coins.csv"
-REMOVED_COINS_FILE = "removed_coins.txt"
+# File for your tracked coins
+COINS_FILE = "coins.csv"
+
+# Reuse HTTP connections
+session = requests.Session()
+
+# Thread lock for shared data
+data_lock = threading.Lock()
 
 # =========================
-# FILE HELPERS
+# LOAD / SAVE COINS
 # =========================
-def load_manual_coins() -> pd.DataFrame:
+def load_coins() -> pd.DataFrame:
     try:
-        df = pd.read_csv(MANUAL_COINS_FILE)
+        df = pd.read_csv(COINS_FILE)
     except Exception:
-        df = pd.DataFrame(columns=["coin", "percent", "direction", "band_expand", "band_shrink"])
+        df = pd.DataFrame(columns=["coin"])
 
-    required_cols = ["coin", "percent", "direction", "band_expand", "band_shrink"]
-    for col in required_cols:
-        if col not in df.columns:
-            df[col] = None
+    if "coin" not in df.columns:
+        df["coin"] = None
 
-    return df[required_cols]
+    df["coin"] = df["coin"].astype(str).str.upper().str.strip()
+    df = df[df["coin"].notna()]
+    df = df[df["coin"] != ""]
+    df = df.drop_duplicates(subset=["coin"]).reset_index(drop=True)
+    return df[["coin"]]
 
-def save_manual_coins(df: pd.DataFrame) -> None:
-    df.to_csv(MANUAL_COINS_FILE, index=False)
+def save_coins(df: pd.DataFrame) -> None:
+    df.to_csv(COINS_FILE, index=False)
 
-def load_removed_symbols() -> set[str]:
-    if not os.path.exists(REMOVED_COINS_FILE):
-        return set()
-    try:
-        with open(REMOVED_COINS_FILE, "r", encoding="utf-8") as f:
-            return {line.strip().upper() for line in f if line.strip()}
-    except Exception:
-        return set()
-
-def save_removed_symbols(symbols: set[str]) -> None:
-    try:
-        with open(REMOVED_COINS_FILE, "w", encoding="utf-8") as f:
-            for sym in sorted(symbols):
-                f.write(sym + "\n")
-    except Exception as e:
-        print("save_removed_symbols error:", e)
-
-manual_coins = load_manual_coins()
-removed_symbols = load_removed_symbols()
-
-coins = pd.DataFrame(columns=["coin", "percent", "direction", "band_expand", "band_shrink"])
+coins = load_coins()
 
 # =========================
 # ALERT TRACKING
 # =========================
-last_alert: dict[str, dict[str, str | None]] = {}
+last_alert = {}
 
 def init_coin_tracking(coin: str) -> None:
     last_alert[coin] = {tf: None for tf in TIMEFRAMES}
 
-def sync_tracking_with_coin_universe() -> None:
-    current = set(coins["coin"].dropna().astype(str).str.upper())
+def sync_tracking() -> None:
+    current = set(coins["coin"].tolist())
     existing = set(last_alert.keys())
 
     for coin in current - existing:
@@ -92,12 +76,14 @@ def sync_tracking_with_coin_universe() -> None:
     for coin in existing - current:
         del last_alert[coin]
 
+sync_tracking()
+
 # =========================
 # TELEGRAM HELPERS
 # =========================
 def send_alert(message: str) -> None:
     try:
-        requests.get(
+        session.get(
             f"{TELEGRAM_URL}/sendMessage",
             params={"chat_id": CHAT_ID, "text": message},
             timeout=15,
@@ -106,88 +92,28 @@ def send_alert(message: str) -> None:
         print("send_alert error:", e)
 
 # =========================
-# BYBIT DATA
+# BYBIT HELPERS
 # =========================
-def fetch_all_bybit_linear_symbols() -> list[str]:
-    symbols = []
-    cursor = None
-
-    while True:
-        params = {
-            "category": "linear",
-            "status": "Trading",
-            "limit": 1000,
-        }
-        if cursor:
-            params["cursor"] = cursor
-
-        try:
-            r = requests.get(BYBIT_INSTRUMENTS_URL, params=params, timeout=20)
-            data = r.json()
-
-            result = data.get("result", {})
-            items = result.get("list", [])
-
-            if not items:
-                break
-
-            for item in items:
-                symbol = item.get("symbol")
-                status = item.get("status")
-                if symbol and status == "Trading":
-                    symbols.append(symbol.upper())
-
-            cursor = result.get("nextPageCursor")
-            if not cursor:
-                break
-
-        except Exception as e:
-            print("fetch_all_bybit_linear_symbols error:", e)
-            break
-
-    return sorted(set(symbols))
-
-def rebuild_coin_universe() -> None:
-    global coins
-
-    auto_symbols = fetch_all_bybit_linear_symbols()
-
-    auto_rows = []
-    for sym in auto_symbols:
-        if sym in removed_symbols:
-            continue
-        auto_rows.append({
-            "coin": sym,
-            "percent": DEFAULT_PERCENT,
-            "direction": DEFAULT_DIRECTION,
-            "band_expand": DEFAULT_BAND_EXPAND,
-            "band_shrink": DEFAULT_BAND_SHRINK,
-        })
-
-    auto_df = pd.DataFrame(auto_rows)
-
-    manual_df = manual_coins.copy()
-    if not manual_df.empty:
-        manual_df["coin"] = manual_df["coin"].astype(str).str.upper()
-        manual_df = manual_df[~manual_df["coin"].isin(removed_symbols)]
-
-    if auto_df.empty and manual_df.empty:
-        coins = pd.DataFrame(columns=["coin", "percent", "direction", "band_expand", "band_shrink"])
-        return
-
-    merged = auto_df.copy()
-
-    if not manual_df.empty:
-        merged = merged[~merged["coin"].isin(manual_df["coin"])]
-        merged = pd.concat([merged, manual_df], ignore_index=True)
-
-    merged = merged.drop_duplicates(subset=["coin"], keep="last")
-    merged = merged.sort_values("coin").reset_index(drop=True)
-    coins = merged[["coin", "percent", "direction", "band_expand", "band_shrink"]]
+def symbol_exists_on_bybit(symbol: str) -> bool:
+    try:
+        r = session.get(
+            BYBIT_INSTRUMENTS_URL,
+            params={"category": "linear", "symbol": symbol.upper()},
+            timeout=15,
+        )
+        data = r.json()
+        items = data.get("result", {}).get("list", [])
+        for item in items:
+            if item.get("symbol", "").upper() == symbol.upper() and item.get("status") == "Trading":
+                return True
+        return False
+    except Exception as e:
+        print("symbol_exists_on_bybit error:", e)
+        return False
 
 def get_ohlc(symbol: str, interval: str) -> pd.DataFrame | None:
     try:
-        r = requests.get(
+        r = session.get(
             BYBIT_KLINE_URL,
             params={
                 "category": "linear",
@@ -198,8 +124,7 @@ def get_ohlc(symbol: str, interval: str) -> pd.DataFrame | None:
             timeout=15,
         )
         data = r.json()
-        result = data.get("result", {})
-        rows = result.get("list", [])
+        rows = data.get("result", {}).get("list", [])
         if not rows:
             return None
 
@@ -207,28 +132,29 @@ def get_ohlc(symbol: str, interval: str) -> pd.DataFrame | None:
 
         df = pd.DataFrame(
             rows,
-            columns=["start_time", "open", "high", "low", "close", "volume", "turnover"],
+            columns=["start_time", "open", "high", "low", "close", "volume", "turnover"]
         )
 
         for col in ["open", "high", "low", "close", "volume", "turnover"]:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
-        return df.dropna().reset_index(drop=True)
+        df = df.dropna().reset_index(drop=True)
+        if len(df) < 200:
+            return None
+
+        return df
     except Exception as e:
         print(f"get_ohlc error for {symbol} {interval}: {e}")
         return None
 
 # =========================
-# INDICATORS
+# EMA HELPERS
 # =========================
-def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+def add_ema(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    df["EMA"] = df["close"].ewm(span=200, adjust=False).mean()
+    df["EMA200"] = df["close"].ewm(span=200, adjust=False).mean()
     return df
 
-# =========================
-# HELPERS
-# =========================
 def ema_distance_percent(price: float, ema: float) -> float:
     if ema == 0:
         return 0.0
@@ -245,14 +171,18 @@ def classify_extreme(distance_pct: float) -> str | None:
 # COMMANDS
 # =========================
 def check_coin(coin: str, tf: str) -> None:
+    if tf not in TIMEFRAMES:
+        send_alert("❌ Timeframe must be 5, 15, or 60")
+        return
+
     df = get_ohlc(coin, tf)
-    if df is None or len(df) < 200:
+    if df is None:
         send_alert(f"{coin} {tf}m ❌ No data")
         return
 
-    df = add_indicators(df)
+    df = add_ema(df)
     price = df["close"].iloc[-1]
-    ema = df["EMA"].iloc[-1]
+    ema = df["EMA200"].iloc[-1]
     distance = ema_distance_percent(price, ema)
     status = classify_extreme(distance)
 
@@ -274,21 +204,27 @@ def check_coin(coin: str, tf: str) -> None:
     )
 
 def show_summary(tf: str) -> None:
+    if tf not in TIMEFRAMES:
+        send_alert("❌ Timeframe must be 5, 15, or 60")
+        return
+
+    with data_lock:
+        coin_list = coins["coin"].tolist()
+
     msg = (
         f"📊 Summary {tf}m\n"
         f"Extreme EMA Standard: {EXTREME_EMA_DISTANCE_PERCENT:.2f}%\n"
     )
 
-    count = 0
-    for _, r in coins.iterrows():
-        coin = r["coin"]
+    found = 0
+    for coin in coin_list:
         df = get_ohlc(coin, tf)
-        if df is None or len(df) < 200:
+        if df is None:
             continue
 
-        df = add_indicators(df)
+        df = add_ema(df)
         price = df["close"].iloc[-1]
-        ema = df["EMA"].iloc[-1]
+        ema = df["EMA200"].iloc[-1]
         distance = ema_distance_percent(price, ema)
         status = classify_extreme(distance)
 
@@ -297,13 +233,13 @@ def show_summary(tf: str) -> None:
 
         direction = "ABOVE" if status == "above" else "BELOW"
         msg += f"{coin} | {direction} | D:{distance:.2f}%\n"
-        count += 1
+        found += 1
 
-        if count >= 50:
+        if found >= 50:
             msg += "... more coins omitted"
             break
 
-    if count == 0:
+    if found == 0:
         msg += "No extreme EMA-distance coins found."
 
     send_alert(msg)
@@ -312,7 +248,7 @@ def show_summary(tf: str) -> None:
 # TELEGRAM LISTENER
 # =========================
 def telegram_listener():
-    global manual_coins, coins, removed_symbols
+    global coins
     last_update_id = None
 
     while True:
@@ -321,7 +257,7 @@ def telegram_listener():
             if last_update_id is not None:
                 params["offset"] = last_update_id + 1
 
-            res = requests.get(f"{TELEGRAM_URL}/getUpdates", params=params, timeout=20).json()
+            res = session.get(f"{TELEGRAM_URL}/getUpdates", params=params, timeout=20).json()
 
             for upd in res.get("result", []):
                 last_update_id = upd["update_id"]
@@ -343,57 +279,58 @@ def telegram_listener():
                 cmd = parts[0].lower()
 
                 if cmd == "/add" and len(parts) == 2:
-                    data = parts[1].split(",")
-                    if len(data) != 5:
-                        send_alert("❌ Format:\n/add BTCUSDT,2,both,50,10")
+                    coin = parts[1].upper().strip()
+
+                    if not coin.endswith("USDT"):
+                        send_alert("❌ Use a valid Bybit linear symbol like BTCUSDT")
                         continue
 
-                    coin, p, d, be, bs = data
-                    coin = coin.upper()
+                    if not symbol_exists_on_bybit(coin):
+                        send_alert(f"❌ {coin} not found on Bybit linear derivatives")
+                        continue
 
-                    if coin in removed_symbols:
-                        removed_symbols.remove(coin)
-                        save_removed_symbols(removed_symbols)
+                    with data_lock:
+                        if coin in coins["coin"].tolist():
+                            send_alert(f"❌ {coin} already exists")
+                            continue
 
-                    manual_coins = manual_coins[manual_coins["coin"].astype(str).str.upper() != coin]
-                    manual_coins.loc[len(manual_coins)] = [
-                        coin, float(p), d.lower(), float(be), float(bs)
-                    ]
+                        coins.loc[len(coins)] = [coin]
+                        coins = coins.drop_duplicates(subset=["coin"]).reset_index(drop=True)
+                        save_coins(coins)
+                        sync_tracking()
 
-                    save_manual_coins(manual_coins)
-                    rebuild_coin_universe()
-                    sync_tracking_with_coin_universe()
-
-                    send_alert(f"✅ {coin} added / updated")
+                    send_alert(f"✅ {coin} added")
 
                 elif cmd == "/remove" and len(parts) == 2:
-                    coin = parts[1].upper()
+                    coin = parts[1].upper().strip()
 
-                    removed_symbols.add(coin)
-                    save_removed_symbols(removed_symbols)
+                    with data_lock:
+                        if coin not in coins["coin"].tolist():
+                            send_alert(f"❌ {coin} not found")
+                            continue
 
-                    manual_coins = manual_coins[manual_coins["coin"].astype(str).str.upper() != coin]
-                    save_manual_coins(manual_coins)
-
-                    rebuild_coin_universe()
-                    sync_tracking_with_coin_universe()
+                        coins = coins[coins["coin"] != coin].reset_index(drop=True)
+                        save_coins(coins)
+                        sync_tracking()
 
                     send_alert(f"❌ {coin} removed")
 
                 elif cmd == "/list":
-                    if coins.empty:
+                    with data_lock:
+                        coin_list = coins["coin"].tolist()
+
+                    if not coin_list:
                         send_alert("⚠️ No coins in list")
                     else:
                         msg = (
                             f"📋 Coins\n"
-                            f"Universe: {len(coins)} symbols\n"
+                            f"Tracked: {len(coin_list)}\n"
                             f"Timeframes: 5m / 15m / 60m\n"
                             f"Extreme EMA Standard: {EXTREME_EMA_DISTANCE_PERCENT:.2f}%\n"
                         )
-                        preview = coins["coin"].tolist()[:100]
-                        msg += "\n".join(preview)
-                        if len(coins) > 100:
-                            msg += f"\n... and {len(coins) - 100} more"
+                        msg += "\n".join(coin_list[:100])
+                        if len(coin_list) > 100:
+                            msg += f"\n... and {len(coin_list) - 100} more"
                         send_alert(msg)
 
                 elif cmd == "/check" and len(parts) == 3:
@@ -403,14 +340,15 @@ def telegram_listener():
                     show_summary(parts[1])
 
                 elif cmd == "/refresh":
-                    rebuild_coin_universe()
-                    sync_tracking_with_coin_universe()
-                    send_alert(f"🔄 Refreshed Bybit universe\nTotal symbols: {len(coins)}")
+                    with data_lock:
+                        coins = load_coins()
+                        sync_tracking()
+                    send_alert(f"🔄 Reloaded local coin list\nTracked coins: {len(coins)}")
 
                 else:
                     send_alert(
                         "Commands:\n"
-                        "/add BTCUSDT,2,both,50,10\n"
+                        "/add BTCUSDT\n"
                         "/remove BTCUSDT\n"
                         "/list\n"
                         "/check BTCUSDT 5\n"
@@ -419,36 +357,21 @@ def telegram_listener():
                     )
 
         except Exception as e:
-            print("TG error:", e)
+            print("telegram_listener error:", e)
 
         time.sleep(2)
 
 # =========================
-# AUTO REFRESH
-# =========================
-def auto_refresh_universe():
-    while True:
-        try:
-            rebuild_coin_universe()
-            sync_tracking_with_coin_universe()
-        except Exception as e:
-            print("auto_refresh_universe error:", e)
-        time.sleep(3600)
-
-# =========================
 # STARTUP
 # =========================
-rebuild_coin_universe()
-sync_tracking_with_coin_universe()
-
 threading.Thread(target=telegram_listener, daemon=True).start()
-threading.Thread(target=auto_refresh_universe, daemon=True).start()
 
 send_alert(
     f"🚨 EMA EXTREME BOT RUNNING 🚨\n"
-    f"Universe: {len(coins)} Bybit linear symbols\n"
+    f"Tracked coins: {len(coins)}\n"
     f"Timeframes: 5m / 15m / 60m\n"
-    f"Alert Standard: {EXTREME_EMA_DISTANCE_PERCENT:.2f}% away from EMA200"
+    f"Alert Standard: {EXTREME_EMA_DISTANCE_PERCENT:.2f}% away from EMA200\n"
+    f"Scan interval: {SCAN_INTERVAL_SECONDS}s"
 )
 
 # =========================
@@ -456,19 +379,19 @@ send_alert(
 # =========================
 while True:
     try:
-        for _, row in coins.iterrows():
-            coin = row["coin"]
+        with data_lock:
+            coin_list = coins["coin"].tolist()
 
+        for coin in coin_list:
             for tf in TIMEFRAMES:
                 df = get_ohlc(coin, tf)
-                if df is None or len(df) < 200:
+                if df is None:
                     continue
 
-                df = add_indicators(df)
+                df = add_ema(df)
                 price = df["close"].iloc[-1]
-                ema = df["EMA"].iloc[-1]
+                ema = df["EMA200"].iloc[-1]
                 distance_pct = ema_distance_percent(price, ema)
-
                 signal = classify_extreme(distance_pct)
 
                 if signal and last_alert[coin][tf] != signal:
@@ -495,8 +418,8 @@ while True:
                 if signal is None:
                     last_alert[coin][tf] = None
 
-        time.sleep(60)
+        time.sleep(SCAN_INTERVAL_SECONDS)
 
     except Exception as e:
-        print("Main error:", e)
-        time.sleep(30)
+        print("Main loop error:", e)
+        time.sleep(10)
