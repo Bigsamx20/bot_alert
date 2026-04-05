@@ -28,7 +28,7 @@ TOP_N_COINS = 100
 # EMA DISTANCE STANDARD
 # =========================
 # Wide / far distance from EMA200 for all coins
-EXTREME_EMA_DISTANCE_PERCENT = 65.0
+EXTREME_EMA_DISTANCE_PERCENT = 45.0
 
 # Scan speed
 SCAN_INTERVAL_SECONDS = 15
