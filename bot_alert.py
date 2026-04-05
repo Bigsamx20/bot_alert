@@ -18,25 +18,28 @@ BYBIT_KLINE_URL = "https://api.bybit.com/v5/market/kline"
 BYBIT_INSTRUMENTS_URL = "https://api.bybit.com/v5/market/instruments-info"
 BYBIT_TICKERS_URL = "https://api.bybit.com/v5/market/tickers"
 
-# Track only these timeframes
+# Timeframes
 TIMEFRAMES = ["5", "15", "60"]
 
-# Top N auto-tracked coins
+# Top N coins by turnover
 TOP_N_COINS = 100
 
-# Universal extreme EMA distance threshold
-EXTREME_EMA_DISTANCE_PERCENT = 15.0
+# =========================
+# EMA DISTANCE STANDARD
+# =========================
+# Wide / far distance from EMA200 for all coins
+EXTREME_EMA_DISTANCE_PERCENT = 65.0
 
-# Faster scan cycle
+# Scan speed
 SCAN_INTERVAL_SECONDS = 15
 
-# Optional local exclusions file
+# Optional local exclusions
 REMOVED_COINS_FILE = "removed_coins.txt"
 
-# Reuse HTTP connections
+# HTTP session reuse
 session = requests.Session()
 
-# Shared data
+# Shared state
 data_lock = threading.Lock()
 coins = pd.DataFrame(columns=["coin"])
 last_alert = {}
@@ -254,7 +257,7 @@ def check_coin(coin: str, tf: str) -> None:
     elif status == "below":
         label = "EXTREMELY FAR BELOW EMA 🔻"
     else:
-        label = "NOT EXTREME"
+        label = "NOT FAR ENOUGH"
 
     send_alert(
         f"📊 {coin} | {tf}m\n"
@@ -263,7 +266,7 @@ def check_coin(coin: str, tf: str) -> None:
         f"Distance: {distance:.2f}%\n"
         f"Price: {price:.6f}\n"
         f"EMA200: {ema:.6f}\n"
-        f"Extreme Standard: {EXTREME_EMA_DISTANCE_PERCENT:.2f}%"
+        f"Required Distance: {EXTREME_EMA_DISTANCE_PERCENT:.2f}%"
     )
 
 def show_summary(tf: str) -> None:
@@ -277,7 +280,7 @@ def show_summary(tf: str) -> None:
     msg = (
         f"📊 Summary {tf}m\n"
         f"Tracked coins: {len(coin_list)}\n"
-        f"Extreme EMA Standard: {EXTREME_EMA_DISTANCE_PERCENT:.2f}%\n"
+        f"Required Distance: ±{EXTREME_EMA_DISTANCE_PERCENT:.2f}% from EMA200\n"
     )
 
     found = 0
@@ -304,7 +307,7 @@ def show_summary(tf: str) -> None:
             break
 
     if found == 0:
-        msg += "No extreme EMA-distance coins found."
+        msg += "No coins found with that distance yet."
 
     send_alert(msg)
 
@@ -352,7 +355,7 @@ def telegram_listener():
                         msg = (
                             f"📋 Top {len(coin_list)} Bybit Coins\n"
                             f"Timeframes: 5m / 15m / 60m\n"
-                            f"Extreme EMA Standard: {EXTREME_EMA_DISTANCE_PERCENT:.2f}%\n"
+                            f"Required Distance: ±{EXTREME_EMA_DISTANCE_PERCENT:.2f}% from EMA200\n"
                         )
                         msg += "\n".join(coin_list[:100])
                         send_alert(msg)
@@ -413,11 +416,11 @@ threading.Thread(target=telegram_listener, daemon=True).start()
 threading.Thread(target=auto_refresh_universe, daemon=True).start()
 
 send_alert(
-    f"🚨 EMA EXTREME BOT RUNNING 🚨\n"
+    f"🚨 EMA DISTANCE BOT RUNNING 🚨\n"
     f"Tracked coins: {len(coins)}\n"
     f"Mode: Top {TOP_N_COINS} Bybit linear coins by 24h turnover\n"
     f"Timeframes: 5m / 15m / 60m\n"
-    f"Alert Standard: {EXTREME_EMA_DISTANCE_PERCENT:.2f}% away from EMA200\n"
+    f"Alert Standard: ±{EXTREME_EMA_DISTANCE_PERCENT:.2f}% from EMA200\n"
     f"Scan interval: {SCAN_INTERVAL_SECONDS}s"
 )
 
@@ -439,6 +442,7 @@ while True:
                 price = df["close"].iloc[-1]
                 ema = df["EMA200"].iloc[-1]
                 distance_pct = ema_distance_percent(price, ema)
+
                 signal = classify_extreme(distance_pct)
 
                 if signal and last_alert[coin][tf] != signal:
@@ -449,7 +453,7 @@ while True:
                             f"Distance: {distance_pct:.2f}%\n"
                             f"Price: {price:.6f}\n"
                             f"EMA200: {ema:.6f}\n"
-                            f"Extreme Standard: {EXTREME_EMA_DISTANCE_PERCENT:.2f}%"
+                            f"Required Distance: ±{EXTREME_EMA_DISTANCE_PERCENT:.2f}%"
                         )
                     else:
                         send_alert(
@@ -458,7 +462,7 @@ while True:
                             f"Distance: {distance_pct:.2f}%\n"
                             f"Price: {price:.6f}\n"
                             f"EMA200: {ema:.6f}\n"
-                            f"Extreme Standard: {EXTREME_EMA_DISTANCE_PERCENT:.2f}%"
+                            f"Required Distance: ±{EXTREME_EMA_DISTANCE_PERCENT:.2f}%"
                         )
                     last_alert[coin][tf] = signal
 
