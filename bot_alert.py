@@ -22,8 +22,11 @@ BYBIT_INSTRUMENTS_URL = "https://api.bybit.com/v5/market/instruments-info"
 # Only these timeframes
 TIMEFRAMES = ["5", "15", "60"]
 
-# Giant candle only on this timeframe
-GIANT_CANDLE_TIMEFRAME = "60"
+# Giant candle rules
+GIANT_CANDLE_TIMEFRAMES = {"5", "60"}
+GIANT_CANDLE_5M_MULTIPLIER = 15         # only 15x on 5m
+GIANT_CANDLE_1H_MIN = 10                # 10x-15x on 1h
+GIANT_CANDLE_1H_MAX = 15
 
 # Fixed RSI for all coins
 RSI_OVERBOUGHT = 90
@@ -613,7 +616,7 @@ send_alert(
     f"Universe: {len(coins)} Bybit linear symbols\n"
     f"RSI fixed at {RSI_OVERBOUGHT}/{RSI_OVERSOLD}\n"
     f"Timeframes: 5m / 15m / 60m\n"
-    f"Giant candles: 1h only\n"
+    f"Giant candles: 5m = 15x only, 1h = 10x to 15x\n"
     f"EMA strength alerts active on 5m / 15m / 60m\n"
     f"Bollinger width alerts active at 12%+"
 )
@@ -793,8 +796,8 @@ while True:
                 if width_percent is None or width_percent < BB_VERY_HIGH_MIN:
                     last_alert[coin][tf]["bb"] = None
 
-                # ---------- GIANT CANDLE (1H ONLY) ----------
-                if tf == GIANT_CANDLE_TIMEFRAME:
+                # ---------- GIANT CANDLE ----------
+                if tf in GIANT_CANDLE_TIMEFRAMES:
                     current_body = df["body_size"].iloc[-1]
                     avg_body = df["avg_body_size"].iloc[-2] if len(df) > 21 else None
 
@@ -805,9 +808,15 @@ while True:
                         ratio = current_body / avg_body
                         ratio_int = int(round(ratio))
 
-                        if 10 <= ratio_int <= 15:
-                            candle_signal = f"{ratio_int}x"
-                            multiplier = ratio_int
+                        if tf == "5":
+                            if ratio_int == GIANT_CANDLE_5M_MULTIPLIER:
+                                candle_signal = f"{ratio_int}x"
+                                multiplier = ratio_int
+
+                        elif tf == "60":
+                            if GIANT_CANDLE_1H_MIN <= ratio_int <= GIANT_CANDLE_1H_MAX:
+                                candle_signal = f"{ratio_int}x"
+                                multiplier = ratio_int
 
                     if candle_signal and last_alert[coin][tf]["candle"] != candle_signal:
                         chart = plot_giant_candle_chart(df, coin, tf)
