@@ -1,10 +1,8 @@
 import os
 import time
-import tempfile
 import threading
 import requests
 import pandas as pd
-import matplotlib.pyplot as plt
 
 # =========================
 # TELEGRAM / GENERAL CONFIG
@@ -22,26 +20,8 @@ BYBIT_INSTRUMENTS_URL = "https://api.bybit.com/v5/market/instruments-info"
 # Only these timeframes
 TIMEFRAMES = ["5", "15", "60"]
 
-# Giant candle rules
-GIANT_CANDLE_TIMEFRAMES = {"5", "60"}
-GIANT_CANDLE_5M_MULTIPLIER = 15         # only 15x on 5m
-GIANT_CANDLE_1H_MIN = 10                # 10x-15x on 1h
-GIANT_CANDLE_1H_MAX = 15
-
-# Fixed RSI for all coins
-RSI_OVERBOUGHT = 90
-RSI_OVERSOLD = 10
-RSI_TOLERANCE = 0.3
-
-# EMA distance classification
-EMA_CLASSIFICATION_TIMEFRAMES = {"5", "15", "60"}
-EMA_STRONG_MIN = 4.0
-EMA_VERY_STRONG_MIN = 6.0
-EMA_OVERSTRETCHED_MIN = 10.0
-
-# Bollinger width percentage classification
-BB_VERY_HIGH_MIN = 12.0
-BB_EXTREME_MIN = 20.0
+# Universal standard for all coins
+EXTREME_EMA_DISTANCE_PERCENT = 10.0
 
 # Default settings for auto-fetched coins
 DEFAULT_PERCENT = 2.0
@@ -66,10 +46,6 @@ def load_manual_coins() -> pd.DataFrame:
     for col in required_cols:
         if col not in df.columns:
             df[col] = None
-
-    for col in ["rsi_overbought", "rsi_oversold"]:
-        if col in df.columns:
-            df = df.drop(columns=[col])
 
     return df[required_cols]
 
@@ -101,19 +77,10 @@ coins = pd.DataFrame(columns=["coin", "percent", "direction", "band_expand", "ba
 # =========================
 # ALERT TRACKING
 # =========================
-last_alert: dict[str, dict[str, dict[str, str | None]]] = {}
+last_alert: dict[str, dict[str, str | None]] = {}
 
 def init_coin_tracking(coin: str) -> None:
-    last_alert[coin] = {
-        tf: {
-            "ema": None,
-            "ema_strength": None,
-            "rsi": None,
-            "bb": None,
-            "candle": None,
-        }
-        for tf in TIMEFRAMES
-    }
+    last_alert[coin] = {tf: None for tf in TIMEFRAMES}
 
 def sync_tracking_with_coin_universe() -> None:
     current = set(coins["coin"].dropna().astype(str).str.upper())
@@ -137,18 +104,6 @@ def send_alert(message: str) -> None:
         )
     except Exception as e:
         print("send_alert error:", e)
-
-def send_image(path: str, caption: str) -> None:
-    try:
-        with open(path, "rb") as img:
-            requests.post(
-                f"{TELEGRAM_URL}/sendPhoto",
-                params={"chat_id": CHAT_ID, "caption": caption},
-                files={"photo": img},
-                timeout=30,
-            )
-    except Exception as e:
-        print("send_image error:", e)
 
 # =========================
 # BYBIT DATA
@@ -268,23 +223,7 @@ def get_ohlc(symbol: str, interval: str) -> pd.DataFrame | None:
 # =========================
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-
     df["EMA"] = df["close"].ewm(span=200, adjust=False).mean()
-
-    df["SMA20"] = df["close"].rolling(20).mean()
-    df["STD20"] = df["close"].rolling(20).std()
-    df["Upper"] = df["SMA20"] + 2 * df["STD20"]
-    df["Lower"] = df["SMA20"] - 2 * df["STD20"]
-
-    delta = df["close"].diff()
-    gain = delta.clip(lower=0).rolling(14).mean()
-    loss = -delta.clip(upper=0).rolling(14).mean()
-    rs = gain / loss.replace(0, 1e-10)
-    df["RSI"] = 100 - (100 / (1 + rs))
-
-    df["body_size"] = (df["close"] - df["open"]).abs()
-    df["avg_body_size"] = df["body_size"].rolling(20).mean()
-
     return df
 
 # =========================
@@ -295,183 +234,77 @@ def ema_distance_percent(price: float, ema: float) -> float:
         return 0.0
     return ((price - ema) / ema) * 100
 
-def classify_ema_distance(distance_pct: float) -> str | None:
-    abs_dist = abs(distance_pct)
-    if abs_dist >= EMA_OVERSTRETCHED_MIN:
-        return "overstretched"
-    if abs_dist >= EMA_VERY_STRONG_MIN:
-        return "very_strong"
-    if abs_dist >= EMA_STRONG_MIN:
-        return "strong"
+def classify_extreme(distance_pct: float) -> str | None:
+    if distance_pct >= EXTREME_EMA_DISTANCE_PERCENT:
+        return "above"
+    if distance_pct <= -EXTREME_EMA_DISTANCE_PERCENT:
+        return "below"
     return None
-
-def classify_direction(distance_pct: float) -> str:
-    return "above" if distance_pct > 0 else "below"
-
-def format_strength_label(level: str) -> str:
-    return {
-        "strong": "STRONG",
-        "very_strong": "VERY STRONG",
-        "overstretched": "OVERSTRETCHED",
-    }.get(level, "NORMAL")
-
-def get_strength_details(distance_pct: float, tf: str):
-    if tf not in EMA_CLASSIFICATION_TIMEFRAMES:
-        return None, None, None
-
-    level = classify_ema_distance(distance_pct)
-    if not level:
-        return None, None, None
-
-    direction = classify_direction(distance_pct)
-    label = format_strength_label(level)
-    return level, direction, label
-
-def classify_bb_width_percent(width_percent: float) -> str | None:
-    if width_percent >= BB_EXTREME_MIN:
-        return "EXTREME"
-    if width_percent >= BB_VERY_HIGH_MIN:
-        return "VERY HIGH"
-    return None
-
-# =========================
-# CHARTS
-# =========================
-def plot_standard_chart(df: pd.DataFrame, coin: str, tf: str) -> str:
-    df = add_indicators(df)
-
-    fig, (ax1, ax2) = plt.subplots(
-        2, 1, figsize=(10, 6), sharex=True,
-        gridspec_kw={"height_ratios": [3, 1]}
-    )
-
-    ax1.plot(df.index, df["close"], label="Price")
-    ax1.plot(df.index, df["EMA"], label="EMA200")
-    ax1.plot(df.index, df["Upper"], label="Upper BB")
-    ax1.plot(df.index, df["Lower"], label="Lower BB")
-    ax1.plot(df.index, df["SMA20"], label="SMA20")
-    ax1.set_title(f"{coin} | {tf}m")
-    ax1.legend()
-
-    ax2.plot(df.index, df["RSI"], label="RSI")
-    ax2.axhline(RSI_OVERBOUGHT, linestyle="--")
-    ax2.axhline(RSI_OVERSOLD, linestyle="--")
-    ax2.set_ylim(0, 100)
-    ax2.legend()
-
-    tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
-    plt.tight_layout()
-    plt.savefig(tmp.name)
-    plt.close()
-    return tmp.name
-
-def plot_giant_candle_chart(df: pd.DataFrame, coin: str, tf: str) -> str:
-    df = add_indicators(df)
-
-    fig, (ax1, ax2) = plt.subplots(
-        2, 1, figsize=(10, 6), sharex=True,
-        gridspec_kw={"height_ratios": [3, 1]}
-    )
-
-    ax1.plot(df.index, df["close"], label="Price")
-    ax1.plot(df.index, df["EMA"], label="EMA200")
-    ax1.plot(df.index, df["Upper"], label="Upper BB")
-    ax1.plot(df.index, df["Lower"], label="Lower BB")
-
-    last_idx = df.index[-1]
-    ax1.axvline(last_idx, linewidth=2)
-    ax1.scatter([last_idx], [df["close"].iloc[-1]], s=80, label="Giant Candle")
-
-    ax1.set_title(f"{coin} | {tf}m | Giant Candle")
-    ax1.legend()
-
-    ax2.plot(df.index, df["RSI"], label="RSI")
-    ax2.axhline(RSI_OVERBOUGHT, linestyle="--")
-    ax2.axhline(RSI_OVERSOLD, linestyle="--")
-    ax2.set_ylim(0, 100)
-    ax2.legend()
-
-    tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
-    plt.tight_layout()
-    plt.savefig(tmp.name)
-    plt.close()
-    return tmp.name
 
 # =========================
 # COMMANDS
 # =========================
-def check_bollinger_width(coin: str, tf: str) -> None:
+def check_coin(coin: str, tf: str) -> None:
     df = get_ohlc(coin, tf)
-    if df is None or len(df) < 20:
+    if df is None or len(df) < 200:
         send_alert(f"{coin} {tf}m ❌ No data")
         return
 
     df = add_indicators(df)
-    chart = plot_standard_chart(df, coin, tf)
-
-    upper = df["Upper"].iloc[-1]
-    lower = df["Lower"].iloc[-1]
-    middle = df["SMA20"].iloc[-1]
-    width_percent = ((upper - lower) / middle) * 100 if pd.notna(middle) and middle != 0 else 0.0
-    width_label = classify_bb_width_percent(width_percent) or "NORMAL"
-
     price = df["close"].iloc[-1]
     ema = df["EMA"].iloc[-1]
     distance = ema_distance_percent(price, ema)
+    status = classify_extreme(distance)
 
-    _level, direction, strength_label = get_strength_details(distance, tf)
-    strength_line = ""
-    if strength_label:
-        direction_text = "ABOVE EMA 🚀" if direction == "above" else "BELOW EMA 🔻"
-        strength_line = f"Strength: {strength_label} ({direction_text})\n"
+    if status == "above":
+        label = "EXTREMELY FAR ABOVE EMA 🚀"
+    elif status == "below":
+        label = "EXTREMELY FAR BELOW EMA 🔻"
+    else:
+        label = "NOT EXTREME"
 
-    send_image(
-        chart,
+    send_alert(
         f"📊 {coin} | {tf}m\n"
-        f"Manual Check\n"
-        f"Price: {price:.2f}\n"
-        f"EMA Distance: {distance:.2f}%\n"
-        f"{strength_line}"
-        f"Bollinger Width: {width_percent:.2f}%\n"
-        f"Width Status: {width_label}\n"
-        f"Upper: {upper:.2f}\n"
-        f"Lower: {lower:.2f}"
+        f"EMA CHECK\n"
+        f"Status: {label}\n"
+        f"Distance: {distance:.2f}%\n"
+        f"Price: {price:.6f}\n"
+        f"EMA200: {ema:.6f}\n"
+        f"Extreme Standard: {EXTREME_EMA_DISTANCE_PERCENT:.2f}%"
     )
 
-    try:
-        os.unlink(chart)
-    except OSError:
-        pass
-
 def show_summary(tf: str) -> None:
-    msg = f"📊 Summary {tf}m\nRSI Zones: {RSI_OVERBOUGHT}/{RSI_OVERSOLD}\n"
+    msg = (
+        f"📊 Summary {tf}m\n"
+        f"Extreme EMA Standard: {EXTREME_EMA_DISTANCE_PERCENT:.2f}%\n"
+    )
 
+    count = 0
     for _, r in coins.iterrows():
         coin = r["coin"]
         df = get_ohlc(coin, tf)
-        if df is None or len(df) < 20:
-            msg += f"{coin}: no data\n"
+        if df is None or len(df) < 200:
             continue
 
         df = add_indicators(df)
-        upper = df["Upper"].iloc[-1]
-        lower = df["Lower"].iloc[-1]
-        middle = df["SMA20"].iloc[-1]
-        width_percent = ((upper - lower) / middle) * 100 if pd.notna(middle) and middle != 0 else 0.0
-
         price = df["close"].iloc[-1]
         ema = df["EMA"].iloc[-1]
         distance = ema_distance_percent(price, ema)
+        status = classify_extreme(distance)
 
-        _level, _direction, strength_label = get_strength_details(distance, tf)
-        strength_part = f" | S:{strength_label}" if strength_label else ""
+        if status is None:
+            continue
 
-        width_label = classify_bb_width_percent(width_percent)
-        width_part = f" | BW:{width_percent:.2f}%"
-        if width_label:
-            width_part += f" {width_label}"
+        direction = "ABOVE" if status == "above" else "BELOW"
+        msg += f"{coin} | {direction} | D:{distance:.2f}%\n"
+        count += 1
 
-        msg += f"{coin} | P:{price:.2f} | D:{distance:.2f}%{strength_part}{width_part}\n"
+        if count >= 50:
+            msg += "... more coins omitted"
+            break
+
+    if count == 0:
+        msg += "No extreme EMA-distance coins found."
 
     send_alert(msg)
 
@@ -531,7 +364,7 @@ def telegram_listener():
                     rebuild_coin_universe()
                     sync_tracking_with_coin_universe()
 
-                    send_alert(f"✅ {coin} added / updated\nRSI fixed at {RSI_OVERBOUGHT}/{RSI_OVERSOLD}")
+                    send_alert(f"✅ {coin} added / updated")
 
                 elif cmd == "/remove" and len(parts) == 2:
                     coin = parts[1].upper()
@@ -554,7 +387,8 @@ def telegram_listener():
                         msg = (
                             f"📋 Coins\n"
                             f"Universe: {len(coins)} symbols\n"
-                            f"RSI fixed: {RSI_OVERBOUGHT}/{RSI_OVERSOLD}\n"
+                            f"Timeframes: 5m / 15m / 60m\n"
+                            f"Extreme EMA Standard: {EXTREME_EMA_DISTANCE_PERCENT:.2f}%\n"
                         )
                         preview = coins["coin"].tolist()[:100]
                         msg += "\n".join(preview)
@@ -563,7 +397,7 @@ def telegram_listener():
                         send_alert(msg)
 
                 elif cmd == "/check" and len(parts) == 3:
-                    check_bollinger_width(parts[1].upper(), parts[2])
+                    check_coin(parts[1].upper(), parts[2])
 
                 elif cmd == "/summary" and len(parts) == 2:
                     show_summary(parts[1])
@@ -581,8 +415,7 @@ def telegram_listener():
                         "/list\n"
                         "/check BTCUSDT 5\n"
                         "/summary 5\n"
-                        "/refresh\n\n"
-                        f"RSI is fixed at {RSI_OVERBOUGHT}/{RSI_OVERSOLD}"
+                        "/refresh"
                     )
 
         except Exception as e:
@@ -612,13 +445,10 @@ threading.Thread(target=telegram_listener, daemon=True).start()
 threading.Thread(target=auto_refresh_universe, daemon=True).start()
 
 send_alert(
-    f"🚨 FULL BOT RUNNING 🚨\n"
+    f"🚨 EMA EXTREME BOT RUNNING 🚨\n"
     f"Universe: {len(coins)} Bybit linear symbols\n"
-    f"RSI fixed at {RSI_OVERBOUGHT}/{RSI_OVERSOLD}\n"
     f"Timeframes: 5m / 15m / 60m\n"
-    f"Giant candles: 5m = 15x only, 1h = 10x to 15x\n"
-    f"EMA strength alerts active on 5m / 15m / 60m\n"
-    f"Bollinger width alerts active at 12%+"
+    f"Alert Standard: {EXTREME_EMA_DISTANCE_PERCENT:.2f}% away from EMA200"
 )
 
 # =========================
@@ -628,8 +458,6 @@ while True:
     try:
         for _, row in coins.iterrows():
             coin = row["coin"]
-            percent = float(row["percent"])
-            direction = str(row["direction"]).lower()
 
             for tf in TIMEFRAMES:
                 df = get_ohlc(coin, tf)
@@ -637,212 +465,35 @@ while True:
                     continue
 
                 df = add_indicators(df)
-
                 price = df["close"].iloc[-1]
                 ema = df["EMA"].iloc[-1]
                 distance_pct = ema_distance_percent(price, ema)
 
-                # ---------- EMA ----------
-                ema_signal = None
-                threshold_above = ema * (1 + percent / 100)
-                threshold_below = ema * (1 - percent / 100)
+                signal = classify_extreme(distance_pct)
 
-                if direction == "above":
-                    if price > threshold_above:
-                        ema_signal = "above"
-                elif direction == "below":
-                    if price < threshold_below:
-                        ema_signal = "below"
-                elif direction == "both":
-                    if price > threshold_above:
-                        ema_signal = "above"
-                    elif price < threshold_below:
-                        ema_signal = "below"
-
-                if ema_signal and last_alert[coin][tf]["ema"] != ema_signal:
-                    if ema_signal == "above":
+                if signal and last_alert[coin][tf] != signal:
+                    if signal == "above":
                         send_alert(
                             f"📊 {coin} | {tf}m\n"
-                            f"EMA ABOVE 🚀\n"
-                            f"Price: {price:.2f}\n"
-                            f"EMA: {ema:.2f}\n"
+                            f"EXTREMELY FAR ABOVE EMA 🚀\n"
                             f"Distance: {distance_pct:.2f}%\n"
-                            f"Threshold: {threshold_above:.2f}"
+                            f"Price: {price:.6f}\n"
+                            f"EMA200: {ema:.6f}\n"
+                            f"Extreme Standard: {EXTREME_EMA_DISTANCE_PERCENT:.2f}%"
                         )
                     else:
                         send_alert(
                             f"📊 {coin} | {tf}m\n"
-                            f"EMA BELOW 🔻\n"
-                            f"Price: {price:.2f}\n"
-                            f"EMA: {ema:.2f}\n"
+                            f"EXTREMELY FAR BELOW EMA 🔻\n"
                             f"Distance: {distance_pct:.2f}%\n"
-                            f"Threshold: {threshold_below:.2f}"
+                            f"Price: {price:.6f}\n"
+                            f"EMA200: {ema:.6f}\n"
+                            f"Extreme Standard: {EXTREME_EMA_DISTANCE_PERCENT:.2f}%"
                         )
-                    last_alert[coin][tf]["ema"] = ema_signal
+                    last_alert[coin][tf] = signal
 
-                if threshold_below <= price <= threshold_above:
-                    last_alert[coin][tf]["ema"] = None
-
-                # ---------- EMA DISTANCE STRENGTH ----------
-                strength_signal = None
-                strength_direction = None
-
-                if tf in EMA_CLASSIFICATION_TIMEFRAMES:
-                    strength_level = classify_ema_distance(distance_pct)
-                    if strength_level:
-                        strength_direction = classify_direction(distance_pct)
-                        strength_signal = f"{strength_direction}_{strength_level}"
-
-                if strength_signal and last_alert[coin][tf]["ema_strength"] != strength_signal:
-                    level = strength_signal.split("_", 1)[1]
-                    direction_text = "ABOVE EMA 🚀" if strength_direction == "above" else "BELOW EMA 🔻"
-
-                    send_alert(
-                        f"📊 {coin} | {tf}m\n"
-                        f"EMA DISTANCE ALERT\n"
-                        f"Strength: {format_strength_label(level)}\n"
-                        f"Direction: {direction_text}\n"
-                        f"Distance: {distance_pct:.2f}%\n"
-                        f"Price: {price:.2f}\n"
-                        f"EMA: {ema:.2f}"
-                    )
-                    last_alert[coin][tf]["ema_strength"] = strength_signal
-
-                if tf in EMA_CLASSIFICATION_TIMEFRAMES and classify_ema_distance(distance_pct) is None:
-                    last_alert[coin][tf]["ema_strength"] = None
-
-                # ---------- RSI ----------
-                rsi = df["RSI"].iloc[-1]
-                rsi_signal = None
-
-                if abs(rsi - RSI_OVERBOUGHT) < RSI_TOLERANCE:
-                    rsi_signal = "high"
-                elif abs(rsi - RSI_OVERSOLD) < RSI_TOLERANCE:
-                    rsi_signal = "low"
-
-                if rsi_signal and last_alert[coin][tf]["rsi"] != rsi_signal:
-                    if rsi_signal == "high":
-                        send_alert(
-                            f"📊 {coin} | {tf}m\n"
-                            f"RSI OVERBOUGHT 🔴\n"
-                            f"RSI: {rsi:.2f}\n"
-                            f"Zone: {RSI_OVERBOUGHT} ± {RSI_TOLERANCE}\n"
-                            f"Price: {price:.2f}"
-                        )
-                    else:
-                        send_alert(
-                            f"📊 {coin} | {tf}m\n"
-                            f"RSI OVERSOLD 🟢\n"
-                            f"RSI: {rsi:.2f}\n"
-                            f"Zone: {RSI_OVERSOLD} ± {RSI_TOLERANCE}\n"
-                            f"Price: {price:.2f}"
-                        )
-                    last_alert[coin][tf]["rsi"] = rsi_signal
-
-                if rsi_signal is None:
-                    last_alert[coin][tf]["rsi"] = None
-
-                # ---------- BOLLINGER WIDTH PERCENT ----------
-                upper = df["Upper"].iloc[-1]
-                lower = df["Lower"].iloc[-1]
-                middle = df["SMA20"].iloc[-1]
-
-                bb_signal = None
-                bb_strength = None
-                width_percent = None
-
-                if pd.notna(middle) and middle != 0:
-                    width_percent = ((upper - lower) / middle) * 100
-
-                    if width_percent >= BB_EXTREME_MIN:
-                        bb_signal = "high_width"
-                        bb_strength = "EXTREME"
-                    elif width_percent >= BB_VERY_HIGH_MIN:
-                        bb_signal = "high_width"
-                        bb_strength = "VERY HIGH"
-
-                if bb_signal and last_alert[coin][tf]["bb"] != bb_strength:
-                    chart = plot_standard_chart(df, coin, tf)
-
-                    _level, bb_strength_direction, ema_strength_label = get_strength_details(distance_pct, tf)
-                    strength_line = ""
-                    if ema_strength_label:
-                        direction_text = "ABOVE EMA 🚀" if bb_strength_direction == "above" else "BELOW EMA 🔻"
-                        strength_line = (
-                            f"EMA Strength: {ema_strength_label}\n"
-                            f"EMA Direction: {direction_text}\n"
-                        )
-
-                    send_image(
-                        chart,
-                        f"📊 {coin} | {tf}m\n"
-                        f"Bollinger Alert\n"
-                        f"Bollinger Width: {width_percent:.2f}%\n"
-                        f"Width Status: {bb_strength}\n"
-                        f"{strength_line}"
-                        f"Price: {price:.2f}\n"
-                        f"EMA Distance: {distance_pct:.2f}%\n"
-                        f"Upper: {upper:.2f}\n"
-                        f"Lower: {lower:.2f}"
-                    )
-
-                    try:
-                        os.unlink(chart)
-                    except OSError:
-                        pass
-
-                    last_alert[coin][tf]["bb"] = bb_strength
-
-                if width_percent is None or width_percent < BB_VERY_HIGH_MIN:
-                    last_alert[coin][tf]["bb"] = None
-
-                # ---------- GIANT CANDLE ----------
-                if tf in GIANT_CANDLE_TIMEFRAMES:
-                    current_body = df["body_size"].iloc[-1]
-                    avg_body = df["avg_body_size"].iloc[-2] if len(df) > 21 else None
-
-                    candle_signal = None
-                    multiplier = None
-
-                    if avg_body is not None and avg_body > 0:
-                        ratio = current_body / avg_body
-                        ratio_int = int(round(ratio))
-
-                        if tf == "5":
-                            if ratio_int == GIANT_CANDLE_5M_MULTIPLIER:
-                                candle_signal = f"{ratio_int}x"
-                                multiplier = ratio_int
-
-                        elif tf == "60":
-                            if GIANT_CANDLE_1H_MIN <= ratio_int <= GIANT_CANDLE_1H_MAX:
-                                candle_signal = f"{ratio_int}x"
-                                multiplier = ratio_int
-
-                    if candle_signal and last_alert[coin][tf]["candle"] != candle_signal:
-                        chart = plot_giant_candle_chart(df, coin, tf)
-
-                        direction_text = "BULLISH 🟢" if df["close"].iloc[-1] >= df["open"].iloc[-1] else "BEARISH 🔴"
-
-                        send_image(
-                            chart,
-                            f"📊 {coin} | {tf}m\n"
-                            f"GIANT CANDLE ALERT 🔥\n"
-                            f"Size: {multiplier}x candle\n"
-                            f"Type: {direction_text}\n"
-                            f"Body Size: {current_body:.4f}\n"
-                            f"Average Body: {avg_body:.4f}\n"
-                            f"Price: {price:.2f}"
-                        )
-
-                        try:
-                            os.unlink(chart)
-                        except OSError:
-                            pass
-
-                        last_alert[coin][tf]["candle"] = candle_signal
-
-                    if candle_signal is None:
-                        last_alert[coin][tf]["candle"] = None
+                if signal is None:
+                    last_alert[coin][tf] = None
 
         time.sleep(60)
 
