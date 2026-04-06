@@ -1,11 +1,16 @@
+import json
+import math
 import os
-import time
 import threading
-import requests
+import time
+from collections import defaultdict
+
 import pandas as pd
+import requests
+import websocket
 
 # =========================
-# TELEGRAM / GENERAL CONFIG
+# TELEGRAM / BYBIT CONFIG
 # =========================
 TOKEN = os.getenv("TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -18,36 +23,59 @@ BYBIT_KLINE_URL = "https://api.bybit.com/v5/market/kline"
 BYBIT_INSTRUMENTS_URL = "https://api.bybit.com/v5/market/instruments-info"
 BYBIT_TICKERS_URL = "https://api.bybit.com/v5/market/tickers"
 
+# Bybit public linear websocket
+BYBIT_WS_LINEAR = "wss://stream.bybit.com/v5/public/linear"
+
 # =========================
 # BOT SETTINGS
 # =========================
 TIMEFRAMES = ["5", "15", "60"]
 TOP_N_COINS = 100
-SCAN_INTERVAL_SECONDS = 15
-REMOVED_COINS_FILE = "removed_coins.txt"
+UNIVERSE_REFRESH_SECONDS = 3600
 
 # EMA strategy
 EXTREME_EMA_DISTANCE_PERCENT = 65.0
 
-# RSI strategy (two separate levels)
+# RSI strategy: separate alerts for both levels
 RSI_OVERBOUGHT_1 = 90.0
 RSI_OVERSOLD_1 = 10.0
 RSI_OVERBOUGHT_2 = 95.0
 RSI_OVERSOLD_2 = 5.0
 RSI_TOLERANCE = 0.3
 
-# Giant candle strategy
-GIANT_CANDLE_TIMEFRAMES = {"5", "15", "60"}
+# Giant candle strategy: all 3 TFs, 10x to 15x
 GIANT_CANDLE_MIN = 10
 GIANT_CANDLE_MAX = 15
+
+REMOVED_COINS_FILE = "removed_coins.txt"
 
 # =========================
 # GLOBAL STATE
 # =========================
 session = requests.Session()
 data_lock = threading.Lock()
-coins = pd.DataFrame(columns=["coin"])
+
+# top-100 universe
+coins = []
+
+# historical + live kline state
+# market_data[symbol][tf] = {
+#   "final": DataFrame of closed candles
+#   "current": dict for open candle snapshot
+#   "last_start": current candle start
+# }
+market_data = defaultdict(lambda: defaultdict(dict))
+
+# alert state
+# last_alert[symbol][tf] = {"ema":..., "rsi_90_10":..., "rsi_95_5":..., "candle":...}
 last_alert = {}
+
+# websocket state
+ws_app = None
+ws_thread = None
+subscribed_topics = set()
+should_run_ws = True
+
 
 # =========================
 # FILE HELPERS
@@ -61,6 +89,7 @@ def load_removed_symbols() -> set[str]:
     except Exception:
         return set()
 
+
 def save_removed_symbols(symbols: set[str]) -> None:
     try:
         with open(REMOVED_COINS_FILE, "w", encoding="utf-8") as f:
@@ -69,34 +98,12 @@ def save_removed_symbols(symbols: set[str]) -> None:
     except Exception as e:
         print("save_removed_symbols error:", e)
 
+
 removed_symbols = load_removed_symbols()
 
-# =========================
-# ALERT TRACKING
-# =========================
-def init_coin_tracking(coin: str) -> None:
-    last_alert[coin] = {
-        tf: {
-            "ema": None,
-            "rsi_90_10": None,
-            "rsi_95_5": None,
-            "candle": None,
-        }
-        for tf in TIMEFRAMES
-    }
-
-def sync_tracking() -> None:
-    current = set(coins["coin"].dropna().astype(str).str.upper())
-    existing = set(last_alert.keys())
-
-    for coin in current - existing:
-        init_coin_tracking(coin)
-
-    for coin in existing - current:
-        del last_alert[coin]
 
 # =========================
-# TELEGRAM HELPERS
+# TELEGRAM
 # =========================
 def send_alert(message: str) -> None:
     try:
@@ -108,8 +115,35 @@ def send_alert(message: str) -> None:
     except Exception as e:
         print("send_alert error:", e)
 
+
 # =========================
-# BYBIT HELPERS
+# ALERT TRACKING
+# =========================
+def init_coin_tracking(symbol: str) -> None:
+    last_alert[symbol] = {
+        tf: {
+            "ema": None,
+            "rsi_90_10": None,
+            "rsi_95_5": None,
+            "candle": None,
+        }
+        for tf in TIMEFRAMES
+    }
+
+
+def sync_tracking() -> None:
+    current = set(coins)
+    existing = set(last_alert.keys())
+
+    for symbol in current - existing:
+        init_coin_tracking(symbol)
+
+    for symbol in existing - current:
+        del last_alert[symbol]
+
+
+# =========================
+# BYBIT REST HELPERS
 # =========================
 def fetch_all_trading_linear_symbols() -> list[str]:
     symbols = []
@@ -149,7 +183,8 @@ def fetch_all_trading_linear_symbols() -> list[str]:
 
     return sorted(set(symbols))
 
-def fetch_linear_tickers() -> dict[str, float]:
+
+def fetch_linear_tickers_turnover() -> dict[str, float]:
     turnover_map = {}
     try:
         r = session.get(
@@ -168,15 +203,14 @@ def fetch_linear_tickers() -> dict[str, float]:
             except Exception:
                 turnover_map[symbol] = 0.0
     except Exception as e:
-        print("fetch_linear_tickers error:", e)
+        print("fetch_linear_tickers_turnover error:", e)
 
     return turnover_map
 
-def rebuild_coin_universe() -> None:
-    global coins
 
+def rebuild_coin_universe() -> list[str]:
     symbols = fetch_all_trading_linear_symbols()
-    turnover_map = fetch_linear_tickers()
+    turnover_map = fetch_linear_tickers_turnover()
 
     ranked = []
     for sym in symbols:
@@ -185,10 +219,8 @@ def rebuild_coin_universe() -> None:
         ranked.append((sym, turnover_map.get(sym, 0.0)))
 
     ranked.sort(key=lambda x: x[1], reverse=True)
-    top_symbols = [sym for sym, _ in ranked[:TOP_N_COINS]]
+    return [sym for sym, _ in ranked[:TOP_N_COINS]]
 
-    coins = pd.DataFrame({"coin": top_symbols})
-    sync_tracking()
 
 def get_ohlc(symbol: str, interval: str) -> pd.DataFrame | None:
     try:
@@ -200,7 +232,7 @@ def get_ohlc(symbol: str, interval: str) -> pd.DataFrame | None:
                 "interval": interval,
                 "limit": 200,
             },
-            timeout=15,
+            timeout=20,
         )
         data = r.json()
         rows = data.get("result", {}).get("list", [])
@@ -226,9 +258,32 @@ def get_ohlc(symbol: str, interval: str) -> pd.DataFrame | None:
         print(f"get_ohlc error for {symbol} {interval}: {e}")
         return None
 
+
 # =========================
 # INDICATORS
 # =========================
+def build_working_df(symbol: str, tf: str) -> pd.DataFrame | None:
+    state = market_data[symbol][tf]
+    final_df = state.get("final")
+
+    if final_df is None or final_df.empty:
+        return None
+
+    working = final_df.copy()
+
+    current = state.get("current")
+    if current:
+        # replace last row if same candle start, else append as live candle
+        if len(working) > 0 and int(working.iloc[-1]["start_time"]) == int(current["start_time"]):
+            working.iloc[-1] = current
+        else:
+            current_df = pd.DataFrame([current])
+            working = pd.concat([working, current_df], ignore_index=True)
+
+    working = working.tail(220).reset_index(drop=True)
+    return working
+
+
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
@@ -245,6 +300,7 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
+
 # =========================
 # STRATEGY HELPERS
 # =========================
@@ -253,12 +309,14 @@ def ema_distance_percent(price: float, ema: float) -> float:
         return 0.0
     return ((price - ema) / ema) * 100
 
+
 def classify_ema_extreme(distance_pct: float) -> str | None:
     if distance_pct >= EXTREME_EMA_DISTANCE_PERCENT:
         return "above"
     if distance_pct <= -EXTREME_EMA_DISTANCE_PERCENT:
         return "below"
     return None
+
 
 def classify_rsi_90_10(rsi: float) -> str | None:
     if abs(rsi - RSI_OVERBOUGHT_1) < RSI_TOLERANCE:
@@ -267,6 +325,7 @@ def classify_rsi_90_10(rsi: float) -> str | None:
         return "low"
     return None
 
+
 def classify_rsi_95_5(rsi: float) -> str | None:
     if abs(rsi - RSI_OVERBOUGHT_2) < RSI_TOLERANCE:
         return "high"
@@ -274,36 +333,187 @@ def classify_rsi_95_5(rsi: float) -> str | None:
         return "low"
     return None
 
-def classify_giant_candle(tf: str, ratio_int: int) -> str | None:
-    if tf in GIANT_CANDLE_TIMEFRAMES and GIANT_CANDLE_MIN <= ratio_int <= GIANT_CANDLE_MAX:
+
+def classify_giant_candle(ratio_int: int) -> str | None:
+    if GIANT_CANDLE_MIN <= ratio_int <= GIANT_CANDLE_MAX:
         return f"{ratio_int}x"
     return None
 
-# =========================
-# COMMANDS
-# =========================
-def check_coin(coin: str, tf: str) -> None:
-    if tf not in TIMEFRAMES:
-        send_alert("❌ Timeframe must be 5, 15, or 60")
-        return
 
-    df = get_ohlc(coin, tf)
-    if df is None:
-        send_alert(f"{coin} {tf}m ❌ No data")
+# =========================
+# SIGNAL EVALUATION
+# =========================
+def evaluate_symbol_tf(symbol: str, tf: str) -> None:
+    df = build_working_df(symbol, tf)
+    if df is None or len(df) < 200:
         return
 
     df = add_indicators(df)
 
-    price = df["close"].iloc[-1]
-    ema = df["EMA200"].iloc[-1]
+    price = float(df["close"].iloc[-1])
+    ema = float(df["EMA200"].iloc[-1])
+    distance_pct = ema_distance_percent(price, ema)
+
+    # ---------- EMA ALERT ----------
+    ema_signal = classify_ema_extreme(distance_pct)
+
+    if ema_signal and last_alert[symbol][tf]["ema"] != ema_signal:
+        if ema_signal == "above":
+            send_alert(
+                f"📊 {symbol} | {tf}m\n"
+                f"EXTREMELY FAR ABOVE EMA 🚀\n"
+                f"Distance: {distance_pct:.2f}%\n"
+                f"Price: {price:.6f}\n"
+                f"EMA200: {ema:.6f}\n"
+                f"Required Distance: ±{EXTREME_EMA_DISTANCE_PERCENT:.2f}%"
+            )
+        else:
+            send_alert(
+                f"📊 {symbol} | {tf}m\n"
+                f"EXTREMELY FAR BELOW EMA 🔻\n"
+                f"Distance: {distance_pct:.2f}%\n"
+                f"Price: {price:.6f}\n"
+                f"EMA200: {ema:.6f}\n"
+                f"Required Distance: ±{EXTREME_EMA_DISTANCE_PERCENT:.2f}%"
+            )
+        last_alert[symbol][tf]["ema"] = ema_signal
+
+    if ema_signal is None:
+        last_alert[symbol][tf]["ema"] = None
+
+    # ---------- RSI 90 / 10 ----------
+    rsi = float(df["RSI"].iloc[-1])
+    rsi_90_10_signal = classify_rsi_90_10(rsi)
+
+    if rsi_90_10_signal and last_alert[symbol][tf]["rsi_90_10"] != rsi_90_10_signal:
+        if rsi_90_10_signal == "high":
+            send_alert(
+                f"📊 {symbol} | {tf}m\n"
+                f"RSI OVERBOUGHT 90 🔴\n"
+                f"RSI: {rsi:.2f}\n"
+                f"Zone: {RSI_OVERBOUGHT_1} ± {RSI_TOLERANCE}\n"
+                f"Price: {price:.6f}"
+            )
+        else:
+            send_alert(
+                f"📊 {symbol} | {tf}m\n"
+                f"RSI OVERSOLD 10 🟢\n"
+                f"RSI: {rsi:.2f}\n"
+                f"Zone: {RSI_OVERSOLD_1} ± {RSI_TOLERANCE}\n"
+                f"Price: {price:.6f}"
+            )
+        last_alert[symbol][tf]["rsi_90_10"] = rsi_90_10_signal
+
+    if rsi_90_10_signal is None:
+        last_alert[symbol][tf]["rsi_90_10"] = None
+
+    # ---------- RSI 95 / 5 ----------
+    rsi_95_5_signal = classify_rsi_95_5(rsi)
+
+    if rsi_95_5_signal and last_alert[symbol][tf]["rsi_95_5"] != rsi_95_5_signal:
+        if rsi_95_5_signal == "high":
+            send_alert(
+                f"📊 {symbol} | {tf}m\n"
+                f"RSI OVERBOUGHT 95 🚨\n"
+                f"RSI: {rsi:.2f}\n"
+                f"Zone: {RSI_OVERBOUGHT_2} ± {RSI_TOLERANCE}\n"
+                f"Price: {price:.6f}"
+            )
+        else:
+            send_alert(
+                f"📊 {symbol} | {tf}m\n"
+                f"RSI OVERSOLD 5 🚨\n"
+                f"RSI: {rsi:.2f}\n"
+                f"Zone: {RSI_OVERSOLD_2} ± {RSI_TOLERANCE}\n"
+                f"Price: {price:.6f}"
+            )
+        last_alert[symbol][tf]["rsi_95_5"] = rsi_95_5_signal
+
+    if rsi_95_5_signal is None:
+        last_alert[symbol][tf]["rsi_95_5"] = None
+
+    # ---------- GIANT CANDLE ----------
+    current_body = df["body_size"].iloc[-1]
+    avg_body = df["avg_body_size"].iloc[-2] if len(df) > 21 else None
+
+    candle_signal = None
+    multiplier = None
+
+    if avg_body is not None and pd.notna(avg_body) and avg_body > 0:
+        ratio = current_body / avg_body
+        ratio_int = int(round(ratio))
+        candle_signal = classify_giant_candle(ratio_int)
+        multiplier = ratio_int if candle_signal else None
+
+    if candle_signal and last_alert[symbol][tf]["candle"] != candle_signal:
+        direction_text = "BULLISH 🟢" if float(df["close"].iloc[-1]) >= float(df["open"].iloc[-1]) else "BEARISH 🔴"
+        send_alert(
+            f"📊 {symbol} | {tf}m\n"
+            f"GIANT CANDLE ALERT 🔥\n"
+            f"Size: {multiplier}x candle\n"
+            f"Type: {direction_text}\n"
+            f"Body Size: {float(current_body):.6f}\n"
+            f"Average Body: {float(avg_body):.6f}\n"
+            f"Price: {price:.6f}"
+        )
+        last_alert[symbol][tf]["candle"] = candle_signal
+
+    if candle_signal is None:
+        last_alert[symbol][tf]["candle"] = None
+
+
+# =========================
+# STARTUP HISTORY LOAD
+# =========================
+def load_initial_history(symbols: list[str]) -> None:
+    for symbol in symbols:
+        for tf in TIMEFRAMES:
+            df = get_ohlc(symbol, tf)
+            if df is None:
+                continue
+
+            market_data[symbol][tf]["final"] = df.copy().tail(220).reset_index(drop=True)
+            market_data[symbol][tf]["current"] = None
+
+            # initial last_start from final candle
+            if len(df) > 0:
+                market_data[symbol][tf]["last_start"] = int(df.iloc[-1]["start_time"])
+
+
+# =========================
+# TELEGRAM COMMANDS
+# =========================
+def check_coin(symbol: str, tf: str) -> None:
+    if tf not in TIMEFRAMES:
+        send_alert("❌ Timeframe must be 5, 15, or 60")
+        return
+
+    with data_lock:
+        if symbol not in market_data or tf not in market_data[symbol]:
+            df = get_ohlc(symbol, tf)
+            if df is None:
+                send_alert(f"{symbol} {tf}m ❌ No data")
+                return
+            market_data[symbol][tf]["final"] = df.copy().tail(220).reset_index(drop=True)
+            market_data[symbol][tf]["current"] = None
+
+    df = build_working_df(symbol, tf)
+    if df is None:
+        send_alert(f"{symbol} {tf}m ❌ No data")
+        return
+
+    df = add_indicators(df)
+
+    price = float(df["close"].iloc[-1])
+    ema = float(df["EMA200"].iloc[-1])
     distance = ema_distance_percent(price, ema)
     ema_status = classify_ema_extreme(distance)
 
-    rsi = df["RSI"].iloc[-1]
+    rsi = float(df["RSI"].iloc[-1])
     rsi_90_10_status = classify_rsi_90_10(rsi)
     rsi_95_5_status = classify_rsi_95_5(rsi)
 
-    msg = f"📊 {coin} | {tf}m\n"
+    msg = f"📊 {symbol} | {tf}m\n"
 
     if ema_status == "above":
         msg += "EMA Status: EXTREMELY FAR ABOVE 🚀\n"
@@ -330,7 +540,7 @@ def check_coin(coin: str, tf: str) -> None:
         avg_body = df["avg_body_size"].iloc[-2]
         if pd.notna(avg_body) and avg_body > 0:
             ratio_int = int(round(current_body / avg_body))
-            candle_signal = classify_giant_candle(tf, ratio_int)
+            candle_signal = classify_giant_candle(ratio_int)
             if candle_signal:
                 msg += f"Giant Candle: YES ({candle_signal}) 🔥\n"
             else:
@@ -345,42 +555,43 @@ def check_coin(coin: str, tf: str) -> None:
 
     send_alert(msg)
 
+
 def show_summary(tf: str) -> None:
     if tf not in TIMEFRAMES:
         send_alert("❌ Timeframe must be 5, 15, or 60")
         return
 
     with data_lock:
-        coin_list = coins["coin"].tolist()
+        symbol_list = list(coins)
 
     msg = (
         f"📊 Summary {tf}m\n"
-        f"Tracked coins: {len(coin_list)}\n"
+        f"Tracked coins: {len(symbol_list)}\n"
         f"EMA Standard: ±{EXTREME_EMA_DISTANCE_PERCENT:.2f}%\n"
         f"RSI Zones: 90/10 and 95/5\n"
     )
 
     found = 0
-    for coin in coin_list:
-        df = get_ohlc(coin, tf)
+    for symbol in symbol_list:
+        df = build_working_df(symbol, tf)
         if df is None:
             continue
 
         df = add_indicators(df)
 
-        price = df["close"].iloc[-1]
-        ema = df["EMA200"].iloc[-1]
+        price = float(df["close"].iloc[-1])
+        ema = float(df["EMA200"].iloc[-1])
         distance = ema_distance_percent(price, ema)
         ema_status = classify_ema_extreme(distance)
 
-        rsi = df["RSI"].iloc[-1]
+        rsi = float(df["RSI"].iloc[-1])
         rsi_90_10_status = classify_rsi_90_10(rsi)
         rsi_95_5_status = classify_rsi_95_5(rsi)
 
         if ema_status is None and rsi_90_10_status is None and rsi_95_5_status is None:
             continue
 
-        parts = [coin]
+        parts = [symbol]
 
         if ema_status == "above":
             parts.append(f"EMA ABOVE {distance:.2f}%")
@@ -409,10 +620,8 @@ def show_summary(tf: str) -> None:
 
     send_alert(msg)
 
-# =========================
-# TELEGRAM LISTENER
-# =========================
-def telegram_listener():
+
+def telegram_listener() -> None:
     global coins, removed_symbols
     last_update_id = None
 
@@ -445,19 +654,19 @@ def telegram_listener():
 
                 if cmd == "/list":
                     with data_lock:
-                        coin_list = coins["coin"].tolist()
+                        symbol_list = list(coins)
 
-                    if not coin_list:
+                    if not symbol_list:
                         send_alert("⚠️ No coins in list")
                     else:
                         msg = (
-                            f"📋 Top {len(coin_list)} Bybit Coins\n"
+                            f"📋 Top {len(symbol_list)} Bybit Coins\n"
                             f"Timeframes: 5m / 15m / 60m\n"
                             f"EMA Standard: ±{EXTREME_EMA_DISTANCE_PERCENT:.2f}%\n"
                             f"RSI: 90/10 and 95/5\n"
                             f"Giant Candle: 5m/15m/1h = 10x to 15x\n"
                         )
-                        msg += "\n".join(coin_list[:100])
+                        msg += "\n".join(symbol_list[:100])
                         send_alert(msg)
 
                 elif cmd == "/check" and len(parts) == 3:
@@ -467,17 +676,15 @@ def telegram_listener():
                     show_summary(parts[1])
 
                 elif cmd == "/refresh":
-                    with data_lock:
-                        rebuild_coin_universe()
+                    refresh_universe_and_data()
                     send_alert(f"🔄 Refreshed top {TOP_N_COINS} Bybit coins\nTracked coins: {len(coins)}")
 
                 elif cmd == "/remove" and len(parts) == 2:
-                    coin = parts[1].upper().strip()
-                    removed_symbols.add(coin)
+                    symbol = parts[1].upper().strip()
+                    removed_symbols.add(symbol)
                     save_removed_symbols(removed_symbols)
-                    with data_lock:
-                        rebuild_coin_universe()
-                    send_alert(f"❌ {coin} removed from tracking")
+                    refresh_universe_and_data()
+                    send_alert(f"❌ {symbol} removed from tracking")
 
                 else:
                     send_alert(
@@ -494,169 +701,192 @@ def telegram_listener():
 
         time.sleep(2)
 
+
 # =========================
-# AUTO REFRESH
+# WEBSOCKET
 # =========================
-def auto_refresh_universe():
+def build_topics(symbols: list[str]) -> list[str]:
+    topics = []
+    for symbol in symbols:
+        for tf in TIMEFRAMES:
+            topics.append(f"kline.{tf}.{symbol}")
+    return topics
+
+
+def subscribe_topics() -> None:
+    global ws_app, subscribed_topics
+    if ws_app is None:
+        return
+
+    topics = build_topics(list(coins))
+    new_topics = [t for t in topics if t not in subscribed_topics]
+
+    chunk_size = 10
+    for i in range(0, len(new_topics), chunk_size):
+        chunk = new_topics[i:i + chunk_size]
+        if not chunk:
+            continue
+
+        payload = {"op": "subscribe", "args": chunk}
+        try:
+            ws_app.send(json.dumps(payload))
+            for topic in chunk:
+                subscribed_topics.add(topic)
+        except Exception as e:
+            print("subscribe_topics error:", e)
+
+
+def on_open(ws):
+    print("WebSocket opened")
+    subscribe_topics()
+
+
+def on_message(ws, message):
+    try:
+        msg = json.loads(message)
+
+        topic = msg.get("topic")
+        if not topic or not topic.startswith("kline."):
+            return
+
+        data_arr = msg.get("data", [])
+        if not data_arr:
+            return
+
+        candle = data_arr[0]
+        parts = topic.split(".")
+        if len(parts) != 3:
+            return
+
+        tf = parts[1]
+        symbol = parts[2].upper()
+
+        row = {
+            "start_time": int(candle["start"]),
+            "open": float(candle["open"]),
+            "high": float(candle["high"]),
+            "low": float(candle["low"]),
+            "close": float(candle["close"]),
+            "volume": float(candle["volume"]),
+            "turnover": float(candle["turnover"]),
+        }
+
+        confirm = bool(candle.get("confirm", False))
+
+        with data_lock:
+            if symbol not in last_alert:
+                init_coin_tracking(symbol)
+
+            state = market_data[symbol][tf]
+            final_df = state.get("final")
+
+            if final_df is None:
+                return
+
+            # live current candle snapshot
+            state["current"] = row
+            state["last_start"] = row["start_time"]
+
+            # if candle is closed, merge into final history
+            if confirm:
+                if len(final_df) > 0 and int(final_df.iloc[-1]["start_time"]) == row["start_time"]:
+                    final_df.iloc[-1] = row
+                else:
+                    final_df = pd.concat([final_df, pd.DataFrame([row])], ignore_index=True)
+                    final_df = final_df.tail(220).reset_index(drop=True)
+
+                state["final"] = final_df
+                state["current"] = None
+
+            evaluate_symbol_tf(symbol, tf)
+
+    except Exception as e:
+        print("on_message error:", e)
+
+
+def on_error(ws, error):
+    print("WebSocket error:", error)
+
+
+def on_close(ws, close_status_code, close_msg):
+    print("WebSocket closed:", close_status_code, close_msg)
+
+
+def websocket_loop():
+    global ws_app, subscribed_topics
+
+    while should_run_ws:
+        try:
+            subscribed_topics = set()
+            ws_app = websocket.WebSocketApp(
+                BYBIT_WS_LINEAR,
+                on_open=on_open,
+                on_message=on_message,
+                on_error=on_error,
+                on_close=on_close,
+            )
+            ws_app.run_forever(ping_interval=20, ping_timeout=10)
+        except Exception as e:
+            print("websocket_loop error:", e)
+
+        time.sleep(5)
+
+
+# =========================
+# UNIVERSE REFRESH
+# =========================
+def refresh_universe_and_data() -> None:
+    global coins
+
+    with data_lock:
+        new_coins = rebuild_coin_universe()
+        coins = new_coins
+        sync_tracking()
+
+        # remove market data for dropped coins
+        for symbol in list(market_data.keys()):
+            if symbol not in coins:
+                del market_data[symbol]
+
+    load_initial_history(list(coins))
+
+    # subscribe newly added topics if websocket is already running
+    subscribe_topics()
+
+
+def universe_refresh_loop():
     while True:
         try:
-            with data_lock:
-                rebuild_coin_universe()
+            refresh_universe_and_data()
         except Exception as e:
-            print("auto_refresh_universe error:", e)
-        time.sleep(3600)
+            print("universe_refresh_loop error:", e)
+        time.sleep(UNIVERSE_REFRESH_SECONDS)
+
 
 # =========================
 # STARTUP
 # =========================
-with data_lock:
-    rebuild_coin_universe()
+coins = rebuild_coin_universe()
+sync_tracking()
+load_initial_history(list(coins))
 
 threading.Thread(target=telegram_listener, daemon=True).start()
-threading.Thread(target=auto_refresh_universe, daemon=True).start()
+threading.Thread(target=universe_refresh_loop, daemon=True).start()
+
+ws_thread = threading.Thread(target=websocket_loop, daemon=True)
+ws_thread.start()
 
 send_alert(
-    f"🚨 COMBINED STRATEGY BOT RUNNING 🚨\n"
+    f"🚨 HYBRID STRATEGY BOT RUNNING 🚨\n"
     f"Tracked coins: {len(coins)}\n"
     f"Mode: Top {TOP_N_COINS} Bybit linear coins by 24h turnover\n"
     f"Timeframes: 5m / 15m / 60m\n"
     f"EMA Standard: ±{EXTREME_EMA_DISTANCE_PERCENT:.2f}% from EMA200\n"
     f"RSI: 90/10 and 95/5\n"
     f"Giant Candle: 5m/15m/1h = 10x to 15x\n"
-    f"Scan interval: {SCAN_INTERVAL_SECONDS}s"
+    f"Data source: Bybit REST + Bybit WebSocket"
 )
 
-# =========================
-# MAIN LOOP
-# =========================
+# keep main thread alive
 while True:
-    try:
-        with data_lock:
-            coin_list = coins["coin"].tolist()
-
-        for coin in coin_list:
-            for tf in TIMEFRAMES:
-                df = get_ohlc(coin, tf)
-                if df is None:
-                    continue
-
-                df = add_indicators(df)
-
-                price = df["close"].iloc[-1]
-                ema = df["EMA200"].iloc[-1]
-                distance_pct = ema_distance_percent(price, ema)
-
-                # ---------- EMA ALERT ----------
-                ema_signal = classify_ema_extreme(distance_pct)
-
-                if ema_signal and last_alert[coin][tf]["ema"] != ema_signal:
-                    if ema_signal == "above":
-                        send_alert(
-                            f"📊 {coin} | {tf}m\n"
-                            f"EXTREMELY FAR ABOVE EMA 🚀\n"
-                            f"Distance: {distance_pct:.2f}%\n"
-                            f"Price: {price:.6f}\n"
-                            f"EMA200: {ema:.6f}\n"
-                            f"Required Distance: ±{EXTREME_EMA_DISTANCE_PERCENT:.2f}%"
-                        )
-                    else:
-                        send_alert(
-                            f"📊 {coin} | {tf}m\n"
-                            f"EXTREMELY FAR BELOW EMA 🔻\n"
-                            f"Distance: {distance_pct:.2f}%\n"
-                            f"Price: {price:.6f}\n"
-                            f"EMA200: {ema:.6f}\n"
-                            f"Required Distance: ±{EXTREME_EMA_DISTANCE_PERCENT:.2f}%"
-                        )
-                    last_alert[coin][tf]["ema"] = ema_signal
-
-                if ema_signal is None:
-                    last_alert[coin][tf]["ema"] = None
-
-                # ---------- RSI 90/10 ALERT ----------
-                rsi = df["RSI"].iloc[-1]
-                rsi_90_10_signal = classify_rsi_90_10(rsi)
-
-                if rsi_90_10_signal and last_alert[coin][tf]["rsi_90_10"] != rsi_90_10_signal:
-                    if rsi_90_10_signal == "high":
-                        send_alert(
-                            f"📊 {coin} | {tf}m\n"
-                            f"RSI OVERBOUGHT 90 🔴\n"
-                            f"RSI: {rsi:.2f}\n"
-                            f"Zone: {RSI_OVERBOUGHT_1} ± {RSI_TOLERANCE}\n"
-                            f"Price: {price:.6f}"
-                        )
-                    else:
-                        send_alert(
-                            f"📊 {coin} | {tf}m\n"
-                            f"RSI OVERSOLD 10 🟢\n"
-                            f"RSI: {rsi:.2f}\n"
-                            f"Zone: {RSI_OVERSOLD_1} ± {RSI_TOLERANCE}\n"
-                            f"Price: {price:.6f}"
-                        )
-                    last_alert[coin][tf]["rsi_90_10"] = rsi_90_10_signal
-
-                if rsi_90_10_signal is None:
-                    last_alert[coin][tf]["rsi_90_10"] = None
-
-                # ---------- RSI 95/5 ALERT ----------
-                rsi_95_5_signal = classify_rsi_95_5(rsi)
-
-                if rsi_95_5_signal and last_alert[coin][tf]["rsi_95_5"] != rsi_95_5_signal:
-                    if rsi_95_5_signal == "high":
-                        send_alert(
-                            f"📊 {coin} | {tf}m\n"
-                            f"RSI OVERBOUGHT 95 🚨\n"
-                            f"RSI: {rsi:.2f}\n"
-                            f"Zone: {RSI_OVERBOUGHT_2} ± {RSI_TOLERANCE}\n"
-                            f"Price: {price:.6f}"
-                        )
-                    else:
-                        send_alert(
-                            f"📊 {coin} | {tf}m\n"
-                            f"RSI OVERSOLD 5 🚨\n"
-                            f"RSI: {rsi:.2f}\n"
-                            f"Zone: {RSI_OVERSOLD_2} ± {RSI_TOLERANCE}\n"
-                            f"Price: {price:.6f}"
-                        )
-                    last_alert[coin][tf]["rsi_95_5"] = rsi_95_5_signal
-
-                if rsi_95_5_signal is None:
-                    last_alert[coin][tf]["rsi_95_5"] = None
-
-                # ---------- GIANT CANDLE ALERT ----------
-                if tf in GIANT_CANDLE_TIMEFRAMES:
-                    current_body = df["body_size"].iloc[-1]
-                    avg_body = df["avg_body_size"].iloc[-2] if len(df) > 21 else None
-
-                    candle_signal = None
-                    multiplier = None
-
-                    if avg_body is not None and avg_body > 0:
-                        ratio = current_body / avg_body
-                        ratio_int = int(round(ratio))
-                        candle_signal = classify_giant_candle(tf, ratio_int)
-                        multiplier = ratio_int if candle_signal else None
-
-                    if candle_signal and last_alert[coin][tf]["candle"] != candle_signal:
-                        direction_text = "BULLISH 🟢" if df["close"].iloc[-1] >= df["open"].iloc[-1] else "BEARISH 🔴"
-
-                        send_alert(
-                            f"📊 {coin} | {tf}m\n"
-                            f"GIANT CANDLE ALERT 🔥\n"
-                            f"Size: {multiplier}x candle\n"
-                            f"Type: {direction_text}\n"
-                            f"Body Size: {current_body:.6f}\n"
-                            f"Average Body: {avg_body:.6f}\n"
-                            f"Price: {price:.6f}"
-                        )
-                        last_alert[coin][tf]["candle"] = candle_signal
-
-                    if candle_signal is None:
-                        last_alert[coin][tf]["candle"] = None
-
-        time.sleep(SCAN_INTERVAL_SECONDS)
-
-    except Exception as e:
-        print("Main loop error:", e)
-        time.sleep(10)
+    time.sleep(60)
