@@ -31,22 +31,21 @@ TIMEFRAMES = ["5", "15", "60"]
 TOP_N_COINS = 100
 UNIVERSE_REFRESH_SECONDS = 3600
 
-# EMA strategy
+# EMA alert settings (kept for alerts only)
 EXTREME_EMA_DISTANCE_PERCENT = 65.0
 
-# RSI strategies
-RSI_OVERBOUGHT_1 = 90.0
-RSI_OVERSOLD_1 = 10.0
-RSI_OVERBOUGHT_2 = 95.0
-RSI_OVERSOLD_2 = 5.0
-RSI_TOLERANCE = 0.3
+# RSI PAPER TEST SETTINGS
+# Easier thresholds for faster testing
+RSI_OVERBOUGHT = 80.0
+RSI_OVERSOLD = 20.0
+RSI_TOLERANCE = 0.5
 RSI_PERIOD = 14
 
-# Giant candle strategy
+# Giant candle alert settings
 GIANT_CANDLE_MIN = 10
 GIANT_CANDLE_MAX = 15
 
-# Paper trading settings
+# Paper trade settings
 PAPER_TRADES_FILE = "paper_trades.json"
 PAPER_SL_PERCENT = 5.0
 PAPER_TP_PERCENT = 10.0
@@ -60,24 +59,14 @@ session = requests.Session()
 data_lock = threading.Lock()
 
 coins = []
-
-# market_data[symbol][tf] = {
-#   "final": DataFrame of closed candles,
-#   "current": dict for live candle,
-#   "last_start": int
-# }
 market_data = defaultdict(lambda: defaultdict(dict))
-
-# last_alert[symbol][tf] = {...}
 last_alert = {}
 
-# websocket state
 ws_app = None
 ws_thread = None
 subscribed_topics = set()
 should_run_ws = True
 
-# paper trades
 paper_trades = {"open": [], "closed": []}
 
 # =========================
@@ -156,10 +145,8 @@ def init_coin_tracking(symbol: str) -> None:
     last_alert[symbol] = {
         tf: {
             "ema": None,
-            "rsi_90_10": None,
-            "rsi_95_5": None,
+            "rsi": None,
             "candle": None,
-            "paper_entry": None,
         }
         for tf in TIMEFRAMES
     }
@@ -447,17 +434,10 @@ def classify_ema_extreme(distance_pct: float) -> str | None:
         return "below"
     return None
 
-def classify_rsi_90_10(rsi: float) -> str | None:
-    if abs(rsi - RSI_OVERBOUGHT_1) < RSI_TOLERANCE:
+def classify_rsi_signal(rsi: float) -> str | None:
+    if abs(rsi - RSI_OVERBOUGHT) < RSI_TOLERANCE:
         return "high"
-    if abs(rsi - RSI_OVERSOLD_1) < RSI_TOLERANCE:
-        return "low"
-    return None
-
-def classify_rsi_95_5(rsi: float) -> str | None:
-    if abs(rsi - RSI_OVERBOUGHT_2) < RSI_TOLERANCE:
-        return "high"
-    if abs(rsi - RSI_OVERSOLD_2) < RSI_TOLERANCE:
+    if abs(rsi - RSI_OVERSOLD) < RSI_TOLERANCE:
         return "low"
     return None
 
@@ -476,11 +456,10 @@ def evaluate_symbol_tf(symbol: str, tf: str) -> None:
 
     df = add_indicators(df)
 
-    # ---------------- EMA uses LIVE candle ----------------
+    # EMA alert uses live candle
     live_price = float(df["close"].iloc[-1])
     live_ema = float(df["EMA200"].iloc[-1])
     distance_pct = ema_distance_percent(live_price, live_ema)
-
     ema_signal = classify_ema_extreme(distance_pct)
 
     if ema_signal and last_alert[symbol][tf]["ema"] != ema_signal:
@@ -507,7 +486,7 @@ def evaluate_symbol_tf(symbol: str, tf: str) -> None:
     if ema_signal is None:
         last_alert[symbol][tf]["ema"] = None
 
-    # ---------------- RSI uses CLOSED candle ----------------
+    # RSI alert uses last closed candle
     if len(df) < 2:
         return
 
@@ -516,57 +495,33 @@ def evaluate_symbol_tf(symbol: str, tf: str) -> None:
     closed_start_time = int(df["start_time"].iloc[-2])
     closed_time_text = format_candle_close_time(closed_start_time, tf)
 
-    rsi_90_10_signal = classify_rsi_90_10(closed_rsi)
-    if rsi_90_10_signal and last_alert[symbol][tf]["rsi_90_10"] != rsi_90_10_signal:
-        if rsi_90_10_signal == "high":
+    rsi_signal = classify_rsi_signal(closed_rsi)
+
+    if rsi_signal and last_alert[symbol][tf]["rsi"] != rsi_signal:
+        if rsi_signal == "high":
             send_alert(
                 f"📊 {symbol} | {tf}m\n"
-                f"RSI OVERBOUGHT 90 🔴\n"
+                f"RSI OVERBOUGHT 80 🔴\n"
                 f"RSI: {closed_rsi:.2f}\n"
-                f"Zone: {RSI_OVERBOUGHT_1} ± {RSI_TOLERANCE}\n"
+                f"Zone: {RSI_OVERBOUGHT} ± {RSI_TOLERANCE}\n"
                 f"Price: {closed_price:.6f}\n"
                 f"Last Candle Close: {closed_time_text}"
             )
         else:
             send_alert(
                 f"📊 {symbol} | {tf}m\n"
-                f"RSI OVERSOLD 10 🟢\n"
+                f"RSI OVERSOLD 20 🟢\n"
                 f"RSI: {closed_rsi:.2f}\n"
-                f"Zone: {RSI_OVERSOLD_1} ± {RSI_TOLERANCE}\n"
+                f"Zone: {RSI_OVERSOLD} ± {RSI_TOLERANCE}\n"
                 f"Price: {closed_price:.6f}\n"
                 f"Last Candle Close: {closed_time_text}"
             )
-        last_alert[symbol][tf]["rsi_90_10"] = rsi_90_10_signal
+        last_alert[symbol][tf]["rsi"] = rsi_signal
 
-    if rsi_90_10_signal is None:
-        last_alert[symbol][tf]["rsi_90_10"] = None
+    if rsi_signal is None:
+        last_alert[symbol][tf]["rsi"] = None
 
-    rsi_95_5_signal = classify_rsi_95_5(closed_rsi)
-    if rsi_95_5_signal and last_alert[symbol][tf]["rsi_95_5"] != rsi_95_5_signal:
-        if rsi_95_5_signal == "high":
-            send_alert(
-                f"📊 {symbol} | {tf}m\n"
-                f"RSI OVERBOUGHT 95 🚨\n"
-                f"RSI: {closed_rsi:.2f}\n"
-                f"Zone: {RSI_OVERBOUGHT_2} ± {RSI_TOLERANCE}\n"
-                f"Price: {closed_price:.6f}\n"
-                f"Last Candle Close: {closed_time_text}"
-            )
-        else:
-            send_alert(
-                f"📊 {symbol} | {tf}m\n"
-                f"RSI OVERSOLD 5 🚨\n"
-                f"RSI: {closed_rsi:.2f}\n"
-                f"Zone: {RSI_OVERSOLD_2} ± {RSI_TOLERANCE}\n"
-                f"Price: {closed_price:.6f}\n"
-                f"Last Candle Close: {closed_time_text}"
-            )
-        last_alert[symbol][tf]["rsi_95_5"] = rsi_95_5_signal
-
-    if rsi_95_5_signal is None:
-        last_alert[symbol][tf]["rsi_95_5"] = None
-
-    # ---------------- Giant candle uses LIVE candle ----------------
+    # Giant candle alert uses live candle
     current_body = df["body_size"].iloc[-1]
     avg_body = df["avg_body_size"].iloc[-2] if len(df) > 21 else None
 
@@ -595,22 +550,17 @@ def evaluate_symbol_tf(symbol: str, tf: str) -> None:
     if candle_signal is None:
         last_alert[symbol][tf]["candle"] = None
 
-    # ---------------- PAPER TRADE ENTRY ----------------
-    buy_signal = ema_signal == "below" and (
-        rsi_90_10_signal == "low" or rsi_95_5_signal == "low"
-    )
-
-    sell_signal = ema_signal == "above" and (
-        rsi_90_10_signal == "high" or rsi_95_5_signal == "high"
-    )
+    # PAPER TRADE ENTRY - RSI ONLY TEST
+    buy_signal = rsi_signal == "low"
+    sell_signal = rsi_signal == "high"
 
     if buy_signal:
-        open_paper_trade(symbol, tf, "BUY", live_price, "EMA below extreme + RSI oversold")
+        open_paper_trade(symbol, tf, "BUY", live_price, "RSI oversold test")
 
     if sell_signal:
-        open_paper_trade(symbol, tf, "SELL", live_price, "EMA above extreme + RSI overbought")
+        open_paper_trade(symbol, tf, "SELL", live_price, "RSI overbought test")
 
-    # ---------------- PAPER TRADE EXIT ----------------
+    # PAPER TRADE EXIT
     update_paper_trades(symbol, tf, live_price)
 
 # =========================
@@ -662,8 +612,7 @@ def check_coin(symbol: str, tf: str) -> None:
     closed_start_time = int(df["start_time"].iloc[-2])
     closed_time_text = format_candle_close_time(closed_start_time, tf)
 
-    rsi_90_10_status = classify_rsi_90_10(closed_rsi)
-    rsi_95_5_status = classify_rsi_95_5(closed_rsi)
+    rsi_status = classify_rsi_signal(closed_rsi)
 
     msg = f"📊 {symbol} | {tf}m\n"
 
@@ -674,29 +623,12 @@ def check_coin(symbol: str, tf: str) -> None:
     else:
         msg += "EMA Status: NOT FAR ENOUGH\n"
 
-    if rsi_90_10_status == "high":
-        msg += "RSI 90 Status: OVERBOUGHT 🔴\n"
-    elif rsi_90_10_status == "low":
-        msg += "RSI 10 Status: OVERSOLD 🟢\n"
-
-    if rsi_95_5_status == "high":
-        msg += "RSI 95 Status: OVERBOUGHT 🚨\n"
-    elif rsi_95_5_status == "low":
-        msg += "RSI 5 Status: OVERSOLD 🚨\n"
-
-    if rsi_90_10_status is None and rsi_95_5_status is None:
+    if rsi_status == "high":
+        msg += "RSI Status: OVERBOUGHT 80 🔴\n"
+    elif rsi_status == "low":
+        msg += "RSI Status: OVERSOLD 20 🟢\n"
+    else:
         msg += "RSI Status: NEUTRAL\n"
-
-    if len(df) > 21:
-        current_body = df["body_size"].iloc[-1]
-        avg_body = df["avg_body_size"].iloc[-2]
-        if pd.notna(avg_body) and avg_body > 0:
-            ratio_int = int(round(current_body / avg_body))
-            candle_signal = classify_giant_candle(ratio_int)
-            if candle_signal:
-                msg += f"Giant Candle: YES ({candle_signal}) 🔥\n"
-            else:
-                msg += "Giant Candle: NO\n"
 
     msg += (
         f"Distance: {distance:.2f}%\n"
@@ -719,8 +651,7 @@ def show_summary(tf: str) -> None:
     msg = (
         f"📊 Summary {tf}m\n"
         f"Tracked coins: {len(symbol_list)}\n"
-        f"EMA Standard: ±{EXTREME_EMA_DISTANCE_PERCENT:.2f}%\n"
-        f"RSI Zones: 90/10 and 95/5\n"
+        f"RSI Test Levels: {RSI_OVERBOUGHT}/{RSI_OVERSOLD}\n"
     )
 
     found = 0
@@ -737,10 +668,9 @@ def show_summary(tf: str) -> None:
         ema_status = classify_ema_extreme(distance)
 
         closed_rsi = float(df["RSI"].iloc[-2])
-        rsi_90_10_status = classify_rsi_90_10(closed_rsi)
-        rsi_95_5_status = classify_rsi_95_5(closed_rsi)
+        rsi_status = classify_rsi_signal(closed_rsi)
 
-        if ema_status is None and rsi_90_10_status is None and rsi_95_5_status is None:
+        if ema_status is None and rsi_status is None:
             continue
 
         parts = [symbol]
@@ -750,15 +680,10 @@ def show_summary(tf: str) -> None:
         elif ema_status == "below":
             parts.append(f"EMA BELOW {distance:.2f}%")
 
-        if rsi_90_10_status == "high":
-            parts.append(f"RSI90 {closed_rsi:.2f} OB")
-        elif rsi_90_10_status == "low":
-            parts.append(f"RSI10 {closed_rsi:.2f} OS")
-
-        if rsi_95_5_status == "high":
-            parts.append(f"RSI95 {closed_rsi:.2f} OB")
-        elif rsi_95_5_status == "low":
-            parts.append(f"RSI5 {closed_rsi:.2f} OS")
+        if rsi_status == "high":
+            parts.append(f"RSI80 {closed_rsi:.2f} OB")
+        elif rsi_status == "low":
+            parts.append(f"RSI20 {closed_rsi:.2f} OS")
 
         msg += " | ".join(parts) + "\n"
         found += 1
@@ -768,7 +693,7 @@ def show_summary(tf: str) -> None:
             break
 
     if found == 0:
-        msg += "No current strategy signals found."
+        msg += "No current signals found."
 
     send_alert(msg)
 
@@ -848,9 +773,8 @@ def telegram_listener() -> None:
                         msg = (
                             f"📋 Top {len(symbol_list)} Bybit Coins\n"
                             f"Timeframes: 5m / 15m / 60m\n"
-                            f"EMA Standard: ±{EXTREME_EMA_DISTANCE_PERCENT:.2f}%\n"
-                            f"RSI: 90/10 and 95/5 (closed candle)\n"
-                            f"Giant Candle: 5m/15m/1h = 10x to 15x\n"
+                            f"RSI Test Levels: {RSI_OVERBOUGHT}/{RSI_OVERSOLD}\n"
+                            f"Paper Trading: RSI ONLY TEST\n"
                         )
                         msg += "\n".join(symbol_list[:100])
                         send_alert(msg)
@@ -1053,14 +977,12 @@ ws_thread = threading.Thread(target=websocket_loop, daemon=True)
 ws_thread.start()
 
 send_alert(
-    f"🚨 HYBRID PAPER TRADING BOT RUNNING 🚨\n"
+    f"🚨 HYBRID RSI PAPER TEST BOT RUNNING 🚨\n"
     f"Tracked coins: {len(coins)}\n"
     f"Mode: Top {TOP_N_COINS} Bybit linear coins by 24h turnover\n"
     f"Timeframes: 5m / 15m / 60m\n"
-    f"EMA Standard: ±{EXTREME_EMA_DISTANCE_PERCENT:.2f}% from EMA200\n"
-    f"RSI: 90/10 and 95/5 using Wilder RSI on closed candle\n"
-    f"Giant Candle: 5m/15m/1h = 10x to 15x\n"
-    f"Paper Trading: ON\n"
+    f"RSI Test Levels: {RSI_OVERBOUGHT}/{RSI_OVERSOLD}\n"
+    f"Paper Trading: RSI ONLY TEST\n"
     f"Data source: Bybit REST + Bybit WebSocket"
 )
 
