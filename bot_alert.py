@@ -501,7 +501,7 @@ def evaluate_symbol_tf(symbol: str, tf: str) -> None:
         if rsi_signal == "high":
             send_alert(
                 f"📊 {symbol} | {tf}m\n"
-                f"RSI OVERBOUGHT 80 🔴\n"
+                f"RSI OVERBOUGHT 70 🔴\n"
                 f"RSI: {closed_rsi:.2f}\n"
                 f"Zone: {RSI_OVERBOUGHT} ± {RSI_TOLERANCE}\n"
                 f"Price: {closed_price:.6f}\n"
@@ -510,7 +510,7 @@ def evaluate_symbol_tf(symbol: str, tf: str) -> None:
         else:
             send_alert(
                 f"📊 {symbol} | {tf}m\n"
-                f"RSI OVERSOLD 20 🟢\n"
+                f"RSI OVERSOLD 30 🟢\n"
                 f"RSI: {closed_rsi:.2f}\n"
                 f"Zone: {RSI_OVERSOLD} ± {RSI_TOLERANCE}\n"
                 f"Price: {closed_price:.6f}\n"
