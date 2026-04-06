@@ -15,6 +15,88 @@ def save_paper_trades(data):
 
 paper_trades = load_paper_trades()
 
+def has_open_trade(symbol, tf):
+    for t in paper_trades["open"]:
+        if t["symbol"] == symbol and t["timeframe"] == tf:
+            return True
+    return False
+
+
+def open_paper_trade(symbol, tf, side, price, reason):
+    if has_open_trade(symbol, tf):
+        return
+
+    if side == "BUY":
+        sl = price * 0.95
+        tp = price * 1.10
+    else:
+        sl = price * 1.05
+        tp = price * 0.90
+
+    trade = {
+        "symbol": symbol,
+        "timeframe": tf,
+        "side": side,
+        "entry": price,
+        "sl": sl,
+        "tp": tp,
+        "status": "OPEN"
+    }
+
+    paper_trades["open"].append(trade)
+    save_paper_trades(paper_trades)
+
+    send_alert(
+        f"📝 PAPER {side}\n"
+        f"{symbol} {tf}m\n"
+        f"Entry: {price:.6f}\n"
+        f"SL: {sl:.6f}\n"
+        f"TP: {tp:.6f}\n"
+        f"{reason}"
+    )
+
+
+def close_trade(trade, price, result):
+    if trade["side"] == "BUY":
+        pnl = (price - trade["entry"]) / trade["entry"] * 100
+    else:
+        pnl = (trade["entry"] - price) / trade["entry"] * 100
+
+    trade["exit"] = price
+    trade["pnl"] = pnl
+    trade["result"] = result
+    trade["status"] = "CLOSED"
+
+    paper_trades["open"].remove(trade)
+    paper_trades["closed"].append(trade)
+
+    save_paper_trades(paper_trades)
+
+    send_alert(
+        f"✅ CLOSED {trade['side']}\n"
+        f"{trade['symbol']} {trade['timeframe']}m\n"
+        f"Exit: {price:.6f}\n"
+        f"{result}\n"
+        f"PnL: {pnl:.2f}%"
+    )
+
+
+def check_trades(symbol, tf, price):
+    for t in paper_trades["open"][:]:
+        if t["symbol"] != symbol or t["timeframe"] != tf:
+            continue
+
+        if t["side"] == "BUY":
+            if price <= t["sl"]:
+                close_trade(t, price, "STOP LOSS")
+            elif price >= t["tp"]:
+                close_trade(t, price, "TAKE PROFIT")
+
+        if t["side"] == "SELL":
+            if price >= t["sl"]:
+                close_trade(t, price, "STOP LOSS")
+            elif price <= t["tp"]:
+                close_trade(t, price, "TAKE PROFIT")
 import json
 import os
 import threading
