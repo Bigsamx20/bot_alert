@@ -29,16 +29,17 @@ REMOVED_COINS_FILE = "removed_coins.txt"
 # EMA strategy
 EXTREME_EMA_DISTANCE_PERCENT = 65.0
 
-# RSI strategy
-RSI_OVERBOUGHT = 90.0
-RSI_OVERSOLD = 10.0
+# RSI strategy (two separate levels)
+RSI_OVERBOUGHT_1 = 90.0
+RSI_OVERSOLD_1 = 10.0
+RSI_OVERBOUGHT_2 = 95.0
+RSI_OVERSOLD_2 = 5.0
 RSI_TOLERANCE = 0.3
 
 # Giant candle strategy
-GIANT_CANDLE_TIMEFRAMES = {"5", "60"}
-GIANT_CANDLE_5M_MULTIPLIER = 15
-GIANT_CANDLE_1H_MIN = 10
-GIANT_CANDLE_1H_MAX = 15
+GIANT_CANDLE_TIMEFRAMES = {"5", "15", "60"}
+GIANT_CANDLE_MIN = 10
+GIANT_CANDLE_MAX = 15
 
 # =========================
 # GLOBAL STATE
@@ -77,7 +78,8 @@ def init_coin_tracking(coin: str) -> None:
     last_alert[coin] = {
         tf: {
             "ema": None,
-            "rsi": None,
+            "rsi_90_10": None,
+            "rsi_95_5": None,
             "candle": None,
         }
         for tf in TIMEFRAMES
@@ -258,20 +260,23 @@ def classify_ema_extreme(distance_pct: float) -> str | None:
         return "below"
     return None
 
-def classify_rsi_signal(rsi: float) -> str | None:
-    if abs(rsi - RSI_OVERBOUGHT) < RSI_TOLERANCE:
+def classify_rsi_90_10(rsi: float) -> str | None:
+    if abs(rsi - RSI_OVERBOUGHT_1) < RSI_TOLERANCE:
         return "high"
-    if abs(rsi - RSI_OVERSOLD) < RSI_TOLERANCE:
+    if abs(rsi - RSI_OVERSOLD_1) < RSI_TOLERANCE:
+        return "low"
+    return None
+
+def classify_rsi_95_5(rsi: float) -> str | None:
+    if abs(rsi - RSI_OVERBOUGHT_2) < RSI_TOLERANCE:
+        return "high"
+    if abs(rsi - RSI_OVERSOLD_2) < RSI_TOLERANCE:
         return "low"
     return None
 
 def classify_giant_candle(tf: str, ratio_int: int) -> str | None:
-    if tf == "5":
-        if ratio_int == GIANT_CANDLE_5M_MULTIPLIER:
-            return f"{ratio_int}x"
-    elif tf == "60":
-        if GIANT_CANDLE_1H_MIN <= ratio_int <= GIANT_CANDLE_1H_MAX:
-            return f"{ratio_int}x"
+    if tf in GIANT_CANDLE_TIMEFRAMES and GIANT_CANDLE_MIN <= ratio_int <= GIANT_CANDLE_MAX:
+        return f"{ratio_int}x"
     return None
 
 # =========================
@@ -295,23 +300,41 @@ def check_coin(coin: str, tf: str) -> None:
     ema_status = classify_ema_extreme(distance)
 
     rsi = df["RSI"].iloc[-1]
-    rsi_status = classify_rsi_signal(rsi)
+    rsi_90_10_status = classify_rsi_90_10(rsi)
+    rsi_95_5_status = classify_rsi_95_5(rsi)
 
     msg = f"📊 {coin} | {tf}m\n"
 
     if ema_status == "above":
-        msg += f"EMA Status: EXTREMELY FAR ABOVE 🚀\n"
+        msg += "EMA Status: EXTREMELY FAR ABOVE 🚀\n"
     elif ema_status == "below":
-        msg += f"EMA Status: EXTREMELY FAR BELOW 🔻\n"
+        msg += "EMA Status: EXTREMELY FAR BELOW 🔻\n"
     else:
-        msg += f"EMA Status: NOT FAR ENOUGH\n"
+        msg += "EMA Status: NOT FAR ENOUGH\n"
 
-    if rsi_status == "high":
-        msg += f"RSI Status: OVERBOUGHT 🔴\n"
-    elif rsi_status == "low":
-        msg += f"RSI Status: OVERSOLD 🟢\n"
-    else:
-        msg += f"RSI Status: NEUTRAL\n"
+    if rsi_90_10_status == "high":
+        msg += "RSI 90 Status: OVERBOUGHT 🔴\n"
+    elif rsi_90_10_status == "low":
+        msg += "RSI 10 Status: OVERSOLD 🟢\n"
+
+    if rsi_95_5_status == "high":
+        msg += "RSI 95 Status: OVERBOUGHT 🚨\n"
+    elif rsi_95_5_status == "low":
+        msg += "RSI 5 Status: OVERSOLD 🚨\n"
+
+    if rsi_90_10_status is None and rsi_95_5_status is None:
+        msg += "RSI Status: NEUTRAL\n"
+
+    if len(df) > 21:
+        current_body = df["body_size"].iloc[-1]
+        avg_body = df["avg_body_size"].iloc[-2]
+        if pd.notna(avg_body) and avg_body > 0:
+            ratio_int = int(round(current_body / avg_body))
+            candle_signal = classify_giant_candle(tf, ratio_int)
+            if candle_signal:
+                msg += f"Giant Candle: YES ({candle_signal}) 🔥\n"
+            else:
+                msg += "Giant Candle: NO\n"
 
     msg += (
         f"Distance: {distance:.2f}%\n"
@@ -334,7 +357,7 @@ def show_summary(tf: str) -> None:
         f"📊 Summary {tf}m\n"
         f"Tracked coins: {len(coin_list)}\n"
         f"EMA Standard: ±{EXTREME_EMA_DISTANCE_PERCENT:.2f}%\n"
-        f"RSI Zones: {RSI_OVERBOUGHT}/{RSI_OVERSOLD}\n"
+        f"RSI Zones: 90/10 and 95/5\n"
     )
 
     found = 0
@@ -351,9 +374,10 @@ def show_summary(tf: str) -> None:
         ema_status = classify_ema_extreme(distance)
 
         rsi = df["RSI"].iloc[-1]
-        rsi_status = classify_rsi_signal(rsi)
+        rsi_90_10_status = classify_rsi_90_10(rsi)
+        rsi_95_5_status = classify_rsi_95_5(rsi)
 
-        if ema_status is None and rsi_status is None:
+        if ema_status is None and rsi_90_10_status is None and rsi_95_5_status is None:
             continue
 
         parts = [coin]
@@ -363,10 +387,15 @@ def show_summary(tf: str) -> None:
         elif ema_status == "below":
             parts.append(f"EMA BELOW {distance:.2f}%")
 
-        if rsi_status == "high":
-            parts.append(f"RSI {rsi:.2f} OVERBOUGHT")
-        elif rsi_status == "low":
-            parts.append(f"RSI {rsi:.2f} OVERSOLD")
+        if rsi_90_10_status == "high":
+            parts.append(f"RSI90 {rsi:.2f} OB")
+        elif rsi_90_10_status == "low":
+            parts.append(f"RSI10 {rsi:.2f} OS")
+
+        if rsi_95_5_status == "high":
+            parts.append(f"RSI95 {rsi:.2f} OB")
+        elif rsi_95_5_status == "low":
+            parts.append(f"RSI5 {rsi:.2f} OS")
 
         msg += " | ".join(parts) + "\n"
         found += 1
@@ -425,8 +454,8 @@ def telegram_listener():
                             f"📋 Top {len(coin_list)} Bybit Coins\n"
                             f"Timeframes: 5m / 15m / 60m\n"
                             f"EMA Standard: ±{EXTREME_EMA_DISTANCE_PERCENT:.2f}%\n"
-                            f"RSI: {RSI_OVERBOUGHT}/{RSI_OVERSOLD}\n"
-                            f"Giant Candle: 5m=15x, 1h=10x-15x\n"
+                            f"RSI: 90/10 and 95/5\n"
+                            f"Giant Candle: 5m/15m/1h = 10x to 15x\n"
                         )
                         msg += "\n".join(coin_list[:100])
                         send_alert(msg)
@@ -492,8 +521,8 @@ send_alert(
     f"Mode: Top {TOP_N_COINS} Bybit linear coins by 24h turnover\n"
     f"Timeframes: 5m / 15m / 60m\n"
     f"EMA Standard: ±{EXTREME_EMA_DISTANCE_PERCENT:.2f}% from EMA200\n"
-    f"RSI: {RSI_OVERBOUGHT}/{RSI_OVERSOLD}\n"
-    f"Giant Candle: 5m=15x, 1h=10x-15x\n"
+    f"RSI: 90/10 and 95/5\n"
+    f"Giant Candle: 5m/15m/1h = 10x to 15x\n"
     f"Scan interval: {SCAN_INTERVAL_SECONDS}s"
 )
 
@@ -544,31 +573,56 @@ while True:
                 if ema_signal is None:
                     last_alert[coin][tf]["ema"] = None
 
-                # ---------- RSI ALERT ----------
+                # ---------- RSI 90/10 ALERT ----------
                 rsi = df["RSI"].iloc[-1]
-                rsi_signal = classify_rsi_signal(rsi)
+                rsi_90_10_signal = classify_rsi_90_10(rsi)
 
-                if rsi_signal and last_alert[coin][tf]["rsi"] != rsi_signal:
-                    if rsi_signal == "high":
+                if rsi_90_10_signal and last_alert[coin][tf]["rsi_90_10"] != rsi_90_10_signal:
+                    if rsi_90_10_signal == "high":
                         send_alert(
                             f"📊 {coin} | {tf}m\n"
-                            f"RSI OVERBOUGHT 🔴\n"
+                            f"RSI OVERBOUGHT 90 🔴\n"
                             f"RSI: {rsi:.2f}\n"
-                            f"Zone: {RSI_OVERBOUGHT} ± {RSI_TOLERANCE}\n"
+                            f"Zone: {RSI_OVERBOUGHT_1} ± {RSI_TOLERANCE}\n"
                             f"Price: {price:.6f}"
                         )
                     else:
                         send_alert(
                             f"📊 {coin} | {tf}m\n"
-                            f"RSI OVERSOLD 🟢\n"
+                            f"RSI OVERSOLD 10 🟢\n"
                             f"RSI: {rsi:.2f}\n"
-                            f"Zone: {RSI_OVERSOLD} ± {RSI_TOLERANCE}\n"
+                            f"Zone: {RSI_OVERSOLD_1} ± {RSI_TOLERANCE}\n"
                             f"Price: {price:.6f}"
                         )
-                    last_alert[coin][tf]["rsi"] = rsi_signal
+                    last_alert[coin][tf]["rsi_90_10"] = rsi_90_10_signal
 
-                if rsi_signal is None:
-                    last_alert[coin][tf]["rsi"] = None
+                if rsi_90_10_signal is None:
+                    last_alert[coin][tf]["rsi_90_10"] = None
+
+                # ---------- RSI 95/5 ALERT ----------
+                rsi_95_5_signal = classify_rsi_95_5(rsi)
+
+                if rsi_95_5_signal and last_alert[coin][tf]["rsi_95_5"] != rsi_95_5_signal:
+                    if rsi_95_5_signal == "high":
+                        send_alert(
+                            f"📊 {coin} | {tf}m\n"
+                            f"RSI OVERBOUGHT 95 🚨\n"
+                            f"RSI: {rsi:.2f}\n"
+                            f"Zone: {RSI_OVERBOUGHT_2} ± {RSI_TOLERANCE}\n"
+                            f"Price: {price:.6f}"
+                        )
+                    else:
+                        send_alert(
+                            f"📊 {coin} | {tf}m\n"
+                            f"RSI OVERSOLD 5 🚨\n"
+                            f"RSI: {rsi:.2f}\n"
+                            f"Zone: {RSI_OVERSOLD_2} ± {RSI_TOLERANCE}\n"
+                            f"Price: {price:.6f}"
+                        )
+                    last_alert[coin][tf]["rsi_95_5"] = rsi_95_5_signal
+
+                if rsi_95_5_signal is None:
+                    last_alert[coin][tf]["rsi_95_5"] = None
 
                 # ---------- GIANT CANDLE ALERT ----------
                 if tf in GIANT_CANDLE_TIMEFRAMES:
