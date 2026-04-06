@@ -1,4 +1,21 @@
 import json
+
+PAPER_TRADES_FILE = "paper_trades.json"
+
+def load_paper_trades():
+    try:
+        with open(PAPER_TRADES_FILE, "r") as f:
+            return json.load(f)
+    except:
+        return {"open": [], "closed": []}
+
+def save_paper_trades(data):
+    with open(PAPER_TRADES_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+paper_trades = load_paper_trades()
+
+import json
 import os
 import threading
 import time
