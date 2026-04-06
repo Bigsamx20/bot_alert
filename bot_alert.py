@@ -18,28 +18,32 @@ BYBIT_KLINE_URL = "https://api.bybit.com/v5/market/kline"
 BYBIT_INSTRUMENTS_URL = "https://api.bybit.com/v5/market/instruments-info"
 BYBIT_TICKERS_URL = "https://api.bybit.com/v5/market/tickers"
 
-# Timeframes
+# =========================
+# BOT SETTINGS
+# =========================
 TIMEFRAMES = ["5", "15", "60"]
-
-# Top N coins by turnover
 TOP_N_COINS = 100
-
-# =========================
-# EMA DISTANCE STANDARD
-# =========================
-# Wide / far distance from EMA200 for all coins
-EXTREME_EMA_DISTANCE_PERCENT = 45.0
-
-# Scan speed
 SCAN_INTERVAL_SECONDS = 15
-
-# Optional local exclusions
 REMOVED_COINS_FILE = "removed_coins.txt"
 
-# HTTP session reuse
-session = requests.Session()
+# EMA strategy
+EXTREME_EMA_DISTANCE_PERCENT = 65.0
 
-# Shared state
+# RSI strategy
+RSI_OVERBOUGHT = 90.0
+RSI_OVERSOLD = 10.0
+RSI_TOLERANCE = 0.3
+
+# Giant candle strategy
+GIANT_CANDLE_TIMEFRAMES = {"5", "60"}
+GIANT_CANDLE_5M_MULTIPLIER = 15
+GIANT_CANDLE_1H_MIN = 10
+GIANT_CANDLE_1H_MAX = 15
+
+# =========================
+# GLOBAL STATE
+# =========================
+session = requests.Session()
 data_lock = threading.Lock()
 coins = pd.DataFrame(columns=["coin"])
 last_alert = {}
@@ -70,7 +74,14 @@ removed_symbols = load_removed_symbols()
 # ALERT TRACKING
 # =========================
 def init_coin_tracking(coin: str) -> None:
-    last_alert[coin] = {tf: None for tf in TIMEFRAMES}
+    last_alert[coin] = {
+        tf: {
+            "ema": None,
+            "rsi": None,
+            "candle": None,
+        }
+        for tf in TIMEFRAMES
+    }
 
 def sync_tracking() -> None:
     current = set(coins["coin"].dropna().astype(str).str.upper())
@@ -214,23 +225,53 @@ def get_ohlc(symbol: str, interval: str) -> pd.DataFrame | None:
         return None
 
 # =========================
-# EMA HELPERS
+# INDICATORS
 # =========================
-def add_ema(df: pd.DataFrame) -> pd.DataFrame:
+def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
+
     df["EMA200"] = df["close"].ewm(span=200, adjust=False).mean()
+
+    delta = df["close"].diff()
+    gain = delta.clip(lower=0).rolling(14).mean()
+    loss = -delta.clip(upper=0).rolling(14).mean()
+    rs = gain / loss.replace(0, 1e-10)
+    df["RSI"] = 100 - (100 / (1 + rs))
+
+    df["body_size"] = (df["close"] - df["open"]).abs()
+    df["avg_body_size"] = df["body_size"].rolling(20).mean()
+
     return df
 
+# =========================
+# STRATEGY HELPERS
+# =========================
 def ema_distance_percent(price: float, ema: float) -> float:
     if ema == 0:
         return 0.0
     return ((price - ema) / ema) * 100
 
-def classify_extreme(distance_pct: float) -> str | None:
+def classify_ema_extreme(distance_pct: float) -> str | None:
     if distance_pct >= EXTREME_EMA_DISTANCE_PERCENT:
         return "above"
     if distance_pct <= -EXTREME_EMA_DISTANCE_PERCENT:
         return "below"
+    return None
+
+def classify_rsi_signal(rsi: float) -> str | None:
+    if abs(rsi - RSI_OVERBOUGHT) < RSI_TOLERANCE:
+        return "high"
+    if abs(rsi - RSI_OVERSOLD) < RSI_TOLERANCE:
+        return "low"
+    return None
+
+def classify_giant_candle(tf: str, ratio_int: int) -> str | None:
+    if tf == "5":
+        if ratio_int == GIANT_CANDLE_5M_MULTIPLIER:
+            return f"{ratio_int}x"
+    elif tf == "60":
+        if GIANT_CANDLE_1H_MIN <= ratio_int <= GIANT_CANDLE_1H_MAX:
+            return f"{ratio_int}x"
     return None
 
 # =========================
@@ -246,28 +287,40 @@ def check_coin(coin: str, tf: str) -> None:
         send_alert(f"{coin} {tf}m ❌ No data")
         return
 
-    df = add_ema(df)
+    df = add_indicators(df)
+
     price = df["close"].iloc[-1]
     ema = df["EMA200"].iloc[-1]
     distance = ema_distance_percent(price, ema)
-    status = classify_extreme(distance)
+    ema_status = classify_ema_extreme(distance)
 
-    if status == "above":
-        label = "EXTREMELY FAR ABOVE EMA 🚀"
-    elif status == "below":
-        label = "EXTREMELY FAR BELOW EMA 🔻"
+    rsi = df["RSI"].iloc[-1]
+    rsi_status = classify_rsi_signal(rsi)
+
+    msg = f"📊 {coin} | {tf}m\n"
+
+    if ema_status == "above":
+        msg += f"EMA Status: EXTREMELY FAR ABOVE 🚀\n"
+    elif ema_status == "below":
+        msg += f"EMA Status: EXTREMELY FAR BELOW 🔻\n"
     else:
-        label = "NOT FAR ENOUGH"
+        msg += f"EMA Status: NOT FAR ENOUGH\n"
 
-    send_alert(
-        f"📊 {coin} | {tf}m\n"
-        f"EMA CHECK\n"
-        f"Status: {label}\n"
+    if rsi_status == "high":
+        msg += f"RSI Status: OVERBOUGHT 🔴\n"
+    elif rsi_status == "low":
+        msg += f"RSI Status: OVERSOLD 🟢\n"
+    else:
+        msg += f"RSI Status: NEUTRAL\n"
+
+    msg += (
         f"Distance: {distance:.2f}%\n"
+        f"RSI: {rsi:.2f}\n"
         f"Price: {price:.6f}\n"
-        f"EMA200: {ema:.6f}\n"
-        f"Required Distance: {EXTREME_EMA_DISTANCE_PERCENT:.2f}%"
+        f"EMA200: {ema:.6f}"
     )
+
+    send_alert(msg)
 
 def show_summary(tf: str) -> None:
     if tf not in TIMEFRAMES:
@@ -280,7 +333,8 @@ def show_summary(tf: str) -> None:
     msg = (
         f"📊 Summary {tf}m\n"
         f"Tracked coins: {len(coin_list)}\n"
-        f"Required Distance: ±{EXTREME_EMA_DISTANCE_PERCENT:.2f}% from EMA200\n"
+        f"EMA Standard: ±{EXTREME_EMA_DISTANCE_PERCENT:.2f}%\n"
+        f"RSI Zones: {RSI_OVERBOUGHT}/{RSI_OVERSOLD}\n"
     )
 
     found = 0
@@ -289,17 +343,32 @@ def show_summary(tf: str) -> None:
         if df is None:
             continue
 
-        df = add_ema(df)
+        df = add_indicators(df)
+
         price = df["close"].iloc[-1]
         ema = df["EMA200"].iloc[-1]
         distance = ema_distance_percent(price, ema)
-        status = classify_extreme(distance)
+        ema_status = classify_ema_extreme(distance)
 
-        if status is None:
+        rsi = df["RSI"].iloc[-1]
+        rsi_status = classify_rsi_signal(rsi)
+
+        if ema_status is None and rsi_status is None:
             continue
 
-        direction = "ABOVE" if status == "above" else "BELOW"
-        msg += f"{coin} | {direction} | D:{distance:.2f}%\n"
+        parts = [coin]
+
+        if ema_status == "above":
+            parts.append(f"EMA ABOVE {distance:.2f}%")
+        elif ema_status == "below":
+            parts.append(f"EMA BELOW {distance:.2f}%")
+
+        if rsi_status == "high":
+            parts.append(f"RSI {rsi:.2f} OVERBOUGHT")
+        elif rsi_status == "low":
+            parts.append(f"RSI {rsi:.2f} OVERSOLD")
+
+        msg += " | ".join(parts) + "\n"
         found += 1
 
         if found >= 50:
@@ -307,7 +376,7 @@ def show_summary(tf: str) -> None:
             break
 
     if found == 0:
-        msg += "No coins found with that distance yet."
+        msg += "No current strategy signals found."
 
     send_alert(msg)
 
@@ -355,7 +424,9 @@ def telegram_listener():
                         msg = (
                             f"📋 Top {len(coin_list)} Bybit Coins\n"
                             f"Timeframes: 5m / 15m / 60m\n"
-                            f"Required Distance: ±{EXTREME_EMA_DISTANCE_PERCENT:.2f}% from EMA200\n"
+                            f"EMA Standard: ±{EXTREME_EMA_DISTANCE_PERCENT:.2f}%\n"
+                            f"RSI: {RSI_OVERBOUGHT}/{RSI_OVERSOLD}\n"
+                            f"Giant Candle: 5m=15x, 1h=10x-15x\n"
                         )
                         msg += "\n".join(coin_list[:100])
                         send_alert(msg)
@@ -416,11 +487,13 @@ threading.Thread(target=telegram_listener, daemon=True).start()
 threading.Thread(target=auto_refresh_universe, daemon=True).start()
 
 send_alert(
-    f"🚨 EMA DISTANCE BOT RUNNING 🚨\n"
+    f"🚨 COMBINED STRATEGY BOT RUNNING 🚨\n"
     f"Tracked coins: {len(coins)}\n"
     f"Mode: Top {TOP_N_COINS} Bybit linear coins by 24h turnover\n"
     f"Timeframes: 5m / 15m / 60m\n"
-    f"Alert Standard: ±{EXTREME_EMA_DISTANCE_PERCENT:.2f}% from EMA200\n"
+    f"EMA Standard: ±{EXTREME_EMA_DISTANCE_PERCENT:.2f}% from EMA200\n"
+    f"RSI: {RSI_OVERBOUGHT}/{RSI_OVERSOLD}\n"
+    f"Giant Candle: 5m=15x, 1h=10x-15x\n"
     f"Scan interval: {SCAN_INTERVAL_SECONDS}s"
 )
 
@@ -438,15 +511,17 @@ while True:
                 if df is None:
                     continue
 
-                df = add_ema(df)
+                df = add_indicators(df)
+
                 price = df["close"].iloc[-1]
                 ema = df["EMA200"].iloc[-1]
                 distance_pct = ema_distance_percent(price, ema)
 
-                signal = classify_extreme(distance_pct)
+                # ---------- EMA ALERT ----------
+                ema_signal = classify_ema_extreme(distance_pct)
 
-                if signal and last_alert[coin][tf] != signal:
-                    if signal == "above":
+                if ema_signal and last_alert[coin][tf]["ema"] != ema_signal:
+                    if ema_signal == "above":
                         send_alert(
                             f"📊 {coin} | {tf}m\n"
                             f"EXTREMELY FAR ABOVE EMA 🚀\n"
@@ -464,10 +539,67 @@ while True:
                             f"EMA200: {ema:.6f}\n"
                             f"Required Distance: ±{EXTREME_EMA_DISTANCE_PERCENT:.2f}%"
                         )
-                    last_alert[coin][tf] = signal
+                    last_alert[coin][tf]["ema"] = ema_signal
 
-                if signal is None:
-                    last_alert[coin][tf] = None
+                if ema_signal is None:
+                    last_alert[coin][tf]["ema"] = None
+
+                # ---------- RSI ALERT ----------
+                rsi = df["RSI"].iloc[-1]
+                rsi_signal = classify_rsi_signal(rsi)
+
+                if rsi_signal and last_alert[coin][tf]["rsi"] != rsi_signal:
+                    if rsi_signal == "high":
+                        send_alert(
+                            f"📊 {coin} | {tf}m\n"
+                            f"RSI OVERBOUGHT 🔴\n"
+                            f"RSI: {rsi:.2f}\n"
+                            f"Zone: {RSI_OVERBOUGHT} ± {RSI_TOLERANCE}\n"
+                            f"Price: {price:.6f}"
+                        )
+                    else:
+                        send_alert(
+                            f"📊 {coin} | {tf}m\n"
+                            f"RSI OVERSOLD 🟢\n"
+                            f"RSI: {rsi:.2f}\n"
+                            f"Zone: {RSI_OVERSOLD} ± {RSI_TOLERANCE}\n"
+                            f"Price: {price:.6f}"
+                        )
+                    last_alert[coin][tf]["rsi"] = rsi_signal
+
+                if rsi_signal is None:
+                    last_alert[coin][tf]["rsi"] = None
+
+                # ---------- GIANT CANDLE ALERT ----------
+                if tf in GIANT_CANDLE_TIMEFRAMES:
+                    current_body = df["body_size"].iloc[-1]
+                    avg_body = df["avg_body_size"].iloc[-2] if len(df) > 21 else None
+
+                    candle_signal = None
+                    multiplier = None
+
+                    if avg_body is not None and avg_body > 0:
+                        ratio = current_body / avg_body
+                        ratio_int = int(round(ratio))
+                        candle_signal = classify_giant_candle(tf, ratio_int)
+                        multiplier = ratio_int if candle_signal else None
+
+                    if candle_signal and last_alert[coin][tf]["candle"] != candle_signal:
+                        direction_text = "BULLISH 🟢" if df["close"].iloc[-1] >= df["open"].iloc[-1] else "BEARISH 🔴"
+
+                        send_alert(
+                            f"📊 {coin} | {tf}m\n"
+                            f"GIANT CANDLE ALERT 🔥\n"
+                            f"Size: {multiplier}x candle\n"
+                            f"Type: {direction_text}\n"
+                            f"Body Size: {current_body:.6f}\n"
+                            f"Average Body: {avg_body:.6f}\n"
+                            f"Price: {price:.6f}"
+                        )
+                        last_alert[coin][tf]["candle"] = candle_signal
+
+                    if candle_signal is None:
+                        last_alert[coin][tf]["candle"] = None
 
         time.sleep(SCAN_INTERVAL_SECONDS)
 
