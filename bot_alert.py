@@ -1,9 +1,9 @@
 import json
-import math
 import os
 import threading
 import time
 from collections import defaultdict
+from datetime import datetime, timezone
 
 import pandas as pd
 import requests
@@ -22,8 +22,6 @@ TELEGRAM_URL = f"https://api.telegram.org/bot{TOKEN}"
 BYBIT_KLINE_URL = "https://api.bybit.com/v5/market/kline"
 BYBIT_INSTRUMENTS_URL = "https://api.bybit.com/v5/market/instruments-info"
 BYBIT_TICKERS_URL = "https://api.bybit.com/v5/market/tickers"
-
-# Bybit public linear websocket
 BYBIT_WS_LINEAR = "wss://stream.bybit.com/v5/public/linear"
 
 # =========================
@@ -36,14 +34,15 @@ UNIVERSE_REFRESH_SECONDS = 3600
 # EMA strategy
 EXTREME_EMA_DISTANCE_PERCENT = 65.0
 
-# RSI strategy: separate alerts for both levels
+# RSI strategies
 RSI_OVERBOUGHT_1 = 90.0
 RSI_OVERSOLD_1 = 10.0
 RSI_OVERBOUGHT_2 = 95.0
 RSI_OVERSOLD_2 = 5.0
 RSI_TOLERANCE = 0.3
+RSI_PERIOD = 14
 
-# Giant candle strategy: all 3 TFs, 10x to 15x
+# Giant candle strategy
 GIANT_CANDLE_MIN = 10
 GIANT_CANDLE_MAX = 15
 
@@ -55,27 +54,22 @@ REMOVED_COINS_FILE = "removed_coins.txt"
 session = requests.Session()
 data_lock = threading.Lock()
 
-# top-100 universe
 coins = []
 
-# historical + live kline state
 # market_data[symbol][tf] = {
-#   "final": DataFrame of closed candles
-#   "current": dict for open candle snapshot
-#   "last_start": current candle start
+#   "final": DataFrame of closed candles,
+#   "current": dict for live candle,
+#   "last_start": int
 # }
 market_data = defaultdict(lambda: defaultdict(dict))
 
-# alert state
-# last_alert[symbol][tf] = {"ema":..., "rsi_90_10":..., "rsi_95_5":..., "candle":...}
+# last_alert[symbol][tf] = {...}
 last_alert = {}
 
-# websocket state
 ws_app = None
 ws_thread = None
 subscribed_topics = set()
 should_run_ws = True
-
 
 # =========================
 # FILE HELPERS
@@ -89,7 +83,6 @@ def load_removed_symbols() -> set[str]:
     except Exception:
         return set()
 
-
 def save_removed_symbols(symbols: set[str]) -> None:
     try:
         with open(REMOVED_COINS_FILE, "w", encoding="utf-8") as f:
@@ -98,9 +91,16 @@ def save_removed_symbols(symbols: set[str]) -> None:
     except Exception as e:
         print("save_removed_symbols error:", e)
 
-
 removed_symbols = load_removed_symbols()
 
+# =========================
+# TIME HELPERS
+# =========================
+def format_candle_close_time(start_time_ms: int, tf: str) -> str:
+    minutes = int(tf)
+    close_time_ms = int(start_time_ms) + minutes * 60 * 1000
+    dt = datetime.fromtimestamp(close_time_ms / 1000, tz=timezone.utc)
+    return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
 
 # =========================
 # TELEGRAM
@@ -114,7 +114,6 @@ def send_alert(message: str) -> None:
         )
     except Exception as e:
         print("send_alert error:", e)
-
 
 # =========================
 # ALERT TRACKING
@@ -130,7 +129,6 @@ def init_coin_tracking(symbol: str) -> None:
         for tf in TIMEFRAMES
     }
 
-
 def sync_tracking() -> None:
     current = set(coins)
     existing = set(last_alert.keys())
@@ -140,7 +138,6 @@ def sync_tracking() -> None:
 
     for symbol in existing - current:
         del last_alert[symbol]
-
 
 # =========================
 # BYBIT REST HELPERS
@@ -183,7 +180,6 @@ def fetch_all_trading_linear_symbols() -> list[str]:
 
     return sorted(set(symbols))
 
-
 def fetch_linear_tickers_turnover() -> dict[str, float]:
     turnover_map = {}
     try:
@@ -207,7 +203,6 @@ def fetch_linear_tickers_turnover() -> dict[str, float]:
 
     return turnover_map
 
-
 def rebuild_coin_universe() -> list[str]:
     symbols = fetch_all_trading_linear_symbols()
     turnover_map = fetch_linear_tickers_turnover()
@@ -220,7 +215,6 @@ def rebuild_coin_universe() -> list[str]:
 
     ranked.sort(key=lambda x: x[1], reverse=True)
     return [sym for sym, _ in ranked[:TOP_N_COINS]]
-
 
 def get_ohlc(symbol: str, interval: str) -> pd.DataFrame | None:
     try:
@@ -246,7 +240,7 @@ def get_ohlc(symbol: str, interval: str) -> pd.DataFrame | None:
             columns=["start_time", "open", "high", "low", "close", "volume", "turnover"],
         )
 
-        for col in ["open", "high", "low", "close", "volume", "turnover"]:
+        for col in ["start_time", "open", "high", "low", "close", "volume", "turnover"]:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
         df = df.dropna().reset_index(drop=True)
@@ -258,9 +252,8 @@ def get_ohlc(symbol: str, interval: str) -> pd.DataFrame | None:
         print(f"get_ohlc error for {symbol} {interval}: {e}")
         return None
 
-
 # =========================
-# INDICATORS
+# INDICATOR HELPERS
 # =========================
 def build_working_df(symbol: str, tf: str) -> pd.DataFrame | None:
     state = market_data[symbol][tf]
@@ -273,7 +266,6 @@ def build_working_df(symbol: str, tf: str) -> pd.DataFrame | None:
 
     current = state.get("current")
     if current:
-        # replace last row if same candle start, else append as live candle
         if len(working) > 0 and int(working.iloc[-1]["start_time"]) == int(current["start_time"]):
             working.iloc[-1] = current
         else:
@@ -283,23 +275,29 @@ def build_working_df(symbol: str, tf: str) -> pd.DataFrame | None:
     working = working.tail(220).reset_index(drop=True)
     return working
 
+def calculate_rsi_wilder(close_series: pd.Series, period: int = 14) -> pd.Series:
+    delta = close_series.diff()
+
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+
+    avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
+
+    rs = avg_gain / avg_loss.replace(0, 1e-10)
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
     df["EMA200"] = df["close"].ewm(span=200, adjust=False).mean()
-
-    delta = df["close"].diff()
-    gain = delta.clip(lower=0).rolling(14).mean()
-    loss = -delta.clip(upper=0).rolling(14).mean()
-    rs = gain / loss.replace(0, 1e-10)
-    df["RSI"] = 100 - (100 / (1 + rs))
+    df["RSI"] = calculate_rsi_wilder(df["close"], RSI_PERIOD)
 
     df["body_size"] = (df["close"] - df["open"]).abs()
     df["avg_body_size"] = df["body_size"].rolling(20).mean()
 
     return df
-
 
 # =========================
 # STRATEGY HELPERS
@@ -309,14 +307,12 @@ def ema_distance_percent(price: float, ema: float) -> float:
         return 0.0
     return ((price - ema) / ema) * 100
 
-
 def classify_ema_extreme(distance_pct: float) -> str | None:
     if distance_pct >= EXTREME_EMA_DISTANCE_PERCENT:
         return "above"
     if distance_pct <= -EXTREME_EMA_DISTANCE_PERCENT:
         return "below"
     return None
-
 
 def classify_rsi_90_10(rsi: float) -> str | None:
     if abs(rsi - RSI_OVERBOUGHT_1) < RSI_TOLERANCE:
@@ -325,7 +321,6 @@ def classify_rsi_90_10(rsi: float) -> str | None:
         return "low"
     return None
 
-
 def classify_rsi_95_5(rsi: float) -> str | None:
     if abs(rsi - RSI_OVERBOUGHT_2) < RSI_TOLERANCE:
         return "high"
@@ -333,12 +328,10 @@ def classify_rsi_95_5(rsi: float) -> str | None:
         return "low"
     return None
 
-
 def classify_giant_candle(ratio_int: int) -> str | None:
     if GIANT_CANDLE_MIN <= ratio_int <= GIANT_CANDLE_MAX:
         return f"{ratio_int}x"
     return None
-
 
 # =========================
 # SIGNAL EVALUATION
@@ -350,11 +343,11 @@ def evaluate_symbol_tf(symbol: str, tf: str) -> None:
 
     df = add_indicators(df)
 
-    price = float(df["close"].iloc[-1])
-    ema = float(df["EMA200"].iloc[-1])
-    distance_pct = ema_distance_percent(price, ema)
+    # ---------------- EMA uses LIVE candle ----------------
+    live_price = float(df["close"].iloc[-1])
+    live_ema = float(df["EMA200"].iloc[-1])
+    distance_pct = ema_distance_percent(live_price, live_ema)
 
-    # ---------- EMA ALERT ----------
     ema_signal = classify_ema_extreme(distance_pct)
 
     if ema_signal and last_alert[symbol][tf]["ema"] != ema_signal:
@@ -363,8 +356,8 @@ def evaluate_symbol_tf(symbol: str, tf: str) -> None:
                 f"📊 {symbol} | {tf}m\n"
                 f"EXTREMELY FAR ABOVE EMA 🚀\n"
                 f"Distance: {distance_pct:.2f}%\n"
-                f"Price: {price:.6f}\n"
-                f"EMA200: {ema:.6f}\n"
+                f"Price: {live_price:.6f}\n"
+                f"EMA200: {live_ema:.6f}\n"
                 f"Required Distance: ±{EXTREME_EMA_DISTANCE_PERCENT:.2f}%"
             )
         else:
@@ -372,8 +365,8 @@ def evaluate_symbol_tf(symbol: str, tf: str) -> None:
                 f"📊 {symbol} | {tf}m\n"
                 f"EXTREMELY FAR BELOW EMA 🔻\n"
                 f"Distance: {distance_pct:.2f}%\n"
-                f"Price: {price:.6f}\n"
-                f"EMA200: {ema:.6f}\n"
+                f"Price: {live_price:.6f}\n"
+                f"EMA200: {live_ema:.6f}\n"
                 f"Required Distance: ±{EXTREME_EMA_DISTANCE_PERCENT:.2f}%"
             )
         last_alert[symbol][tf]["ema"] = ema_signal
@@ -381,58 +374,66 @@ def evaluate_symbol_tf(symbol: str, tf: str) -> None:
     if ema_signal is None:
         last_alert[symbol][tf]["ema"] = None
 
-    # ---------- RSI 90 / 10 ----------
-    rsi = float(df["RSI"].iloc[-1])
-    rsi_90_10_signal = classify_rsi_90_10(rsi)
+    # ---------------- RSI uses CLOSED candle ----------------
+    if len(df) < 2:
+        return
 
+    closed_price = float(df["close"].iloc[-2])
+    closed_rsi = float(df["RSI"].iloc[-2])
+    closed_start_time = int(df["start_time"].iloc[-2])
+    closed_time_text = format_candle_close_time(closed_start_time, tf)
+
+    rsi_90_10_signal = classify_rsi_90_10(closed_rsi)
     if rsi_90_10_signal and last_alert[symbol][tf]["rsi_90_10"] != rsi_90_10_signal:
         if rsi_90_10_signal == "high":
             send_alert(
                 f"📊 {symbol} | {tf}m\n"
                 f"RSI OVERBOUGHT 90 🔴\n"
-                f"RSI: {rsi:.2f}\n"
+                f"RSI: {closed_rsi:.2f}\n"
                 f"Zone: {RSI_OVERBOUGHT_1} ± {RSI_TOLERANCE}\n"
-                f"Price: {price:.6f}"
+                f"Price: {closed_price:.6f}\n"
+                f"Last Candle Close: {closed_time_text}"
             )
         else:
             send_alert(
                 f"📊 {symbol} | {tf}m\n"
                 f"RSI OVERSOLD 10 🟢\n"
-                f"RSI: {rsi:.2f}\n"
+                f"RSI: {closed_rsi:.2f}\n"
                 f"Zone: {RSI_OVERSOLD_1} ± {RSI_TOLERANCE}\n"
-                f"Price: {price:.6f}"
+                f"Price: {closed_price:.6f}\n"
+                f"Last Candle Close: {closed_time_text}"
             )
         last_alert[symbol][tf]["rsi_90_10"] = rsi_90_10_signal
 
     if rsi_90_10_signal is None:
         last_alert[symbol][tf]["rsi_90_10"] = None
 
-    # ---------- RSI 95 / 5 ----------
-    rsi_95_5_signal = classify_rsi_95_5(rsi)
-
+    rsi_95_5_signal = classify_rsi_95_5(closed_rsi)
     if rsi_95_5_signal and last_alert[symbol][tf]["rsi_95_5"] != rsi_95_5_signal:
         if rsi_95_5_signal == "high":
             send_alert(
                 f"📊 {symbol} | {tf}m\n"
                 f"RSI OVERBOUGHT 95 🚨\n"
-                f"RSI: {rsi:.2f}\n"
+                f"RSI: {closed_rsi:.2f}\n"
                 f"Zone: {RSI_OVERBOUGHT_2} ± {RSI_TOLERANCE}\n"
-                f"Price: {price:.6f}"
+                f"Price: {closed_price:.6f}\n"
+                f"Last Candle Close: {closed_time_text}"
             )
         else:
             send_alert(
                 f"📊 {symbol} | {tf}m\n"
                 f"RSI OVERSOLD 5 🚨\n"
-                f"RSI: {rsi:.2f}\n"
+                f"RSI: {closed_rsi:.2f}\n"
                 f"Zone: {RSI_OVERSOLD_2} ± {RSI_TOLERANCE}\n"
-                f"Price: {price:.6f}"
+                f"Price: {closed_price:.6f}\n"
+                f"Last Candle Close: {closed_time_text}"
             )
         last_alert[symbol][tf]["rsi_95_5"] = rsi_95_5_signal
 
     if rsi_95_5_signal is None:
         last_alert[symbol][tf]["rsi_95_5"] = None
 
-    # ---------- GIANT CANDLE ----------
+    # ---------------- Giant candle uses LIVE candle ----------------
     current_body = df["body_size"].iloc[-1]
     avg_body = df["avg_body_size"].iloc[-2] if len(df) > 21 else None
 
@@ -454,13 +455,12 @@ def evaluate_symbol_tf(symbol: str, tf: str) -> None:
             f"Type: {direction_text}\n"
             f"Body Size: {float(current_body):.6f}\n"
             f"Average Body: {float(avg_body):.6f}\n"
-            f"Price: {price:.6f}"
+            f"Price: {live_price:.6f}"
         )
         last_alert[symbol][tf]["candle"] = candle_signal
 
     if candle_signal is None:
         last_alert[symbol][tf]["candle"] = None
-
 
 # =========================
 # STARTUP HISTORY LOAD
@@ -475,10 +475,8 @@ def load_initial_history(symbols: list[str]) -> None:
             market_data[symbol][tf]["final"] = df.copy().tail(220).reset_index(drop=True)
             market_data[symbol][tf]["current"] = None
 
-            # initial last_start from final candle
             if len(df) > 0:
                 market_data[symbol][tf]["last_start"] = int(df.iloc[-1]["start_time"])
-
 
 # =========================
 # TELEGRAM COMMANDS
@@ -498,20 +496,23 @@ def check_coin(symbol: str, tf: str) -> None:
             market_data[symbol][tf]["current"] = None
 
     df = build_working_df(symbol, tf)
-    if df is None:
+    if df is None or len(df) < 2:
         send_alert(f"{symbol} {tf}m ❌ No data")
         return
 
     df = add_indicators(df)
 
-    price = float(df["close"].iloc[-1])
-    ema = float(df["EMA200"].iloc[-1])
-    distance = ema_distance_percent(price, ema)
+    live_price = float(df["close"].iloc[-1])
+    live_ema = float(df["EMA200"].iloc[-1])
+    distance = ema_distance_percent(live_price, live_ema)
     ema_status = classify_ema_extreme(distance)
 
-    rsi = float(df["RSI"].iloc[-1])
-    rsi_90_10_status = classify_rsi_90_10(rsi)
-    rsi_95_5_status = classify_rsi_95_5(rsi)
+    closed_rsi = float(df["RSI"].iloc[-2])
+    closed_start_time = int(df["start_time"].iloc[-2])
+    closed_time_text = format_candle_close_time(closed_start_time, tf)
+
+    rsi_90_10_status = classify_rsi_90_10(closed_rsi)
+    rsi_95_5_status = classify_rsi_95_5(closed_rsi)
 
     msg = f"📊 {symbol} | {tf}m\n"
 
@@ -548,13 +549,13 @@ def check_coin(symbol: str, tf: str) -> None:
 
     msg += (
         f"Distance: {distance:.2f}%\n"
-        f"RSI: {rsi:.2f}\n"
-        f"Price: {price:.6f}\n"
-        f"EMA200: {ema:.6f}"
+        f"RSI (closed candle): {closed_rsi:.2f}\n"
+        f"Last Candle Close: {closed_time_text}\n"
+        f"Live Price: {live_price:.6f}\n"
+        f"EMA200: {live_ema:.6f}"
     )
 
     send_alert(msg)
-
 
 def show_summary(tf: str) -> None:
     if tf not in TIMEFRAMES:
@@ -574,19 +575,19 @@ def show_summary(tf: str) -> None:
     found = 0
     for symbol in symbol_list:
         df = build_working_df(symbol, tf)
-        if df is None:
+        if df is None or len(df) < 2:
             continue
 
         df = add_indicators(df)
 
-        price = float(df["close"].iloc[-1])
-        ema = float(df["EMA200"].iloc[-1])
-        distance = ema_distance_percent(price, ema)
+        live_price = float(df["close"].iloc[-1])
+        live_ema = float(df["EMA200"].iloc[-1])
+        distance = ema_distance_percent(live_price, live_ema)
         ema_status = classify_ema_extreme(distance)
 
-        rsi = float(df["RSI"].iloc[-1])
-        rsi_90_10_status = classify_rsi_90_10(rsi)
-        rsi_95_5_status = classify_rsi_95_5(rsi)
+        closed_rsi = float(df["RSI"].iloc[-2])
+        rsi_90_10_status = classify_rsi_90_10(closed_rsi)
+        rsi_95_5_status = classify_rsi_95_5(closed_rsi)
 
         if ema_status is None and rsi_90_10_status is None and rsi_95_5_status is None:
             continue
@@ -599,14 +600,14 @@ def show_summary(tf: str) -> None:
             parts.append(f"EMA BELOW {distance:.2f}%")
 
         if rsi_90_10_status == "high":
-            parts.append(f"RSI90 {rsi:.2f} OB")
+            parts.append(f"RSI90 {closed_rsi:.2f} OB")
         elif rsi_90_10_status == "low":
-            parts.append(f"RSI10 {rsi:.2f} OS")
+            parts.append(f"RSI10 {closed_rsi:.2f} OS")
 
         if rsi_95_5_status == "high":
-            parts.append(f"RSI95 {rsi:.2f} OB")
+            parts.append(f"RSI95 {closed_rsi:.2f} OB")
         elif rsi_95_5_status == "low":
-            parts.append(f"RSI5 {rsi:.2f} OS")
+            parts.append(f"RSI5 {closed_rsi:.2f} OS")
 
         msg += " | ".join(parts) + "\n"
         found += 1
@@ -619,7 +620,6 @@ def show_summary(tf: str) -> None:
         msg += "No current strategy signals found."
 
     send_alert(msg)
-
 
 def telegram_listener() -> None:
     global coins, removed_symbols
@@ -663,7 +663,7 @@ def telegram_listener() -> None:
                             f"📋 Top {len(symbol_list)} Bybit Coins\n"
                             f"Timeframes: 5m / 15m / 60m\n"
                             f"EMA Standard: ±{EXTREME_EMA_DISTANCE_PERCENT:.2f}%\n"
-                            f"RSI: 90/10 and 95/5\n"
+                            f"RSI: 90/10 and 95/5 (closed candle)\n"
                             f"Giant Candle: 5m/15m/1h = 10x to 15x\n"
                         )
                         msg += "\n".join(symbol_list[:100])
@@ -701,7 +701,6 @@ def telegram_listener() -> None:
 
         time.sleep(2)
 
-
 # =========================
 # WEBSOCKET
 # =========================
@@ -711,7 +710,6 @@ def build_topics(symbols: list[str]) -> list[str]:
         for tf in TIMEFRAMES:
             topics.append(f"kline.{tf}.{symbol}")
     return topics
-
 
 def subscribe_topics() -> None:
     global ws_app, subscribed_topics
@@ -735,11 +733,9 @@ def subscribe_topics() -> None:
         except Exception as e:
             print("subscribe_topics error:", e)
 
-
 def on_open(ws):
     print("WebSocket opened")
     subscribe_topics()
-
 
 def on_message(ws, message):
     try:
@@ -783,11 +779,9 @@ def on_message(ws, message):
             if final_df is None:
                 return
 
-            # live current candle snapshot
             state["current"] = row
             state["last_start"] = row["start_time"]
 
-            # if candle is closed, merge into final history
             if confirm:
                 if len(final_df) > 0 and int(final_df.iloc[-1]["start_time"]) == row["start_time"]:
                     final_df.iloc[-1] = row
@@ -803,14 +797,11 @@ def on_message(ws, message):
     except Exception as e:
         print("on_message error:", e)
 
-
 def on_error(ws, error):
     print("WebSocket error:", error)
 
-
 def on_close(ws, close_status_code, close_msg):
     print("WebSocket closed:", close_status_code, close_msg)
-
 
 def websocket_loop():
     global ws_app, subscribed_topics
@@ -831,7 +822,6 @@ def websocket_loop():
 
         time.sleep(5)
 
-
 # =========================
 # UNIVERSE REFRESH
 # =========================
@@ -843,16 +833,12 @@ def refresh_universe_and_data() -> None:
         coins = new_coins
         sync_tracking()
 
-        # remove market data for dropped coins
         for symbol in list(market_data.keys()):
             if symbol not in coins:
                 del market_data[symbol]
 
     load_initial_history(list(coins))
-
-    # subscribe newly added topics if websocket is already running
     subscribe_topics()
-
 
 def universe_refresh_loop():
     while True:
@@ -861,7 +847,6 @@ def universe_refresh_loop():
         except Exception as e:
             print("universe_refresh_loop error:", e)
         time.sleep(UNIVERSE_REFRESH_SECONDS)
-
 
 # =========================
 # STARTUP
@@ -882,11 +867,10 @@ send_alert(
     f"Mode: Top {TOP_N_COINS} Bybit linear coins by 24h turnover\n"
     f"Timeframes: 5m / 15m / 60m\n"
     f"EMA Standard: ±{EXTREME_EMA_DISTANCE_PERCENT:.2f}% from EMA200\n"
-    f"RSI: 90/10 and 95/5\n"
+    f"RSI: 90/10 and 95/5 using Wilder RSI on closed candle\n"
     f"Giant Candle: 5m/15m/1h = 10x to 15x\n"
     f"Data source: Bybit REST + Bybit WebSocket"
 )
 
-# keep main thread alive
 while True:
     time.sleep(60)
