@@ -1,103 +1,4 @@
 import json
-
-PAPER_TRADES_FILE = "paper_trades.json"
-
-def load_paper_trades():
-    try:
-        with open(PAPER_TRADES_FILE, "r") as f:
-            return json.load(f)
-    except:
-        return {"open": [], "closed": []}
-
-def save_paper_trades(data):
-    with open(PAPER_TRADES_FILE, "w") as f:
-        json.dump(data, f, indent=2)
-
-paper_trades = load_paper_trades()
-
-def has_open_trade(symbol, tf):
-    for t in paper_trades["open"]:
-        if t["symbol"] == symbol and t["timeframe"] == tf:
-            return True
-    return False
-
-
-def open_paper_trade(symbol, tf, side, price, reason):
-    if has_open_trade(symbol, tf):
-        return
-
-    if side == "BUY":
-        sl = price * 0.95
-        tp = price * 1.10
-    else:
-        sl = price * 1.05
-        tp = price * 0.90
-
-    trade = {
-        "symbol": symbol,
-        "timeframe": tf,
-        "side": side,
-        "entry": price,
-        "sl": sl,
-        "tp": tp,
-        "status": "OPEN"
-    }
-
-    paper_trades["open"].append(trade)
-    save_paper_trades(paper_trades)
-
-    send_alert(
-        f"📝 PAPER {side}\n"
-        f"{symbol} {tf}m\n"
-        f"Entry: {price:.6f}\n"
-        f"SL: {sl:.6f}\n"
-        f"TP: {tp:.6f}\n"
-        f"{reason}"
-    )
-
-
-def close_trade(trade, price, result):
-    if trade["side"] == "BUY":
-        pnl = (price - trade["entry"]) / trade["entry"] * 100
-    else:
-        pnl = (trade["entry"] - price) / trade["entry"] * 100
-
-    trade["exit"] = price
-    trade["pnl"] = pnl
-    trade["result"] = result
-    trade["status"] = "CLOSED"
-
-    paper_trades["open"].remove(trade)
-    paper_trades["closed"].append(trade)
-
-    save_paper_trades(paper_trades)
-
-    send_alert(
-        f"✅ CLOSED {trade['side']}\n"
-        f"{trade['symbol']} {trade['timeframe']}m\n"
-        f"Exit: {price:.6f}\n"
-        f"{result}\n"
-        f"PnL: {pnl:.2f}%"
-    )
-
-
-def check_trades(symbol, tf, price):
-    for t in paper_trades["open"][:]:
-        if t["symbol"] != symbol or t["timeframe"] != tf:
-            continue
-
-        if t["side"] == "BUY":
-            if price <= t["sl"]:
-                close_trade(t, price, "STOP LOSS")
-            elif price >= t["tp"]:
-                close_trade(t, price, "TAKE PROFIT")
-
-        if t["side"] == "SELL":
-            if price >= t["sl"]:
-                close_trade(t, price, "STOP LOSS")
-            elif price <= t["tp"]:
-                close_trade(t, price, "TAKE PROFIT")
-import json
 import os
 import threading
 import time
@@ -145,6 +46,11 @@ RSI_PERIOD = 14
 GIANT_CANDLE_MIN = 10
 GIANT_CANDLE_MAX = 15
 
+# Paper trading settings
+PAPER_TRADES_FILE = "paper_trades.json"
+PAPER_SL_PERCENT = 5.0
+PAPER_TP_PERCENT = 10.0
+
 REMOVED_COINS_FILE = "removed_coins.txt"
 
 # =========================
@@ -165,10 +71,14 @@ market_data = defaultdict(lambda: defaultdict(dict))
 # last_alert[symbol][tf] = {...}
 last_alert = {}
 
+# websocket state
 ws_app = None
 ws_thread = None
 subscribed_topics = set()
 should_run_ws = True
+
+# paper trades
+paper_trades = {"open": [], "closed": []}
 
 # =========================
 # FILE HELPERS
@@ -190,11 +100,36 @@ def save_removed_symbols(symbols: set[str]) -> None:
     except Exception as e:
         print("save_removed_symbols error:", e)
 
+def load_paper_trades() -> dict:
+    if not os.path.exists(PAPER_TRADES_FILE):
+        return {"open": [], "closed": []}
+    try:
+        with open(PAPER_TRADES_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if "open" not in data:
+                data["open"] = []
+            if "closed" not in data:
+                data["closed"] = []
+            return data
+    except Exception:
+        return {"open": [], "closed": []}
+
+def save_paper_trades() -> None:
+    try:
+        with open(PAPER_TRADES_FILE, "w", encoding="utf-8") as f:
+            json.dump(paper_trades, f, indent=2)
+    except Exception as e:
+        print("save_paper_trades error:", e)
+
 removed_symbols = load_removed_symbols()
+paper_trades = load_paper_trades()
 
 # =========================
 # TIME HELPERS
 # =========================
+def now_utc_text() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
 def format_candle_close_time(start_time_ms: int, tf: str) -> str:
     minutes = int(tf)
     close_time_ms = int(start_time_ms) + minutes * 60 * 1000
@@ -224,6 +159,7 @@ def init_coin_tracking(symbol: str) -> None:
             "rsi_90_10": None,
             "rsi_95_5": None,
             "candle": None,
+            "paper_entry": None,
         }
         for tf in TIMEFRAMES
     }
@@ -237,6 +173,104 @@ def sync_tracking() -> None:
 
     for symbol in existing - current:
         del last_alert[symbol]
+
+# =========================
+# PAPER TRADING HELPERS
+# =========================
+def has_open_trade(symbol: str, tf: str) -> bool:
+    for trade in paper_trades["open"]:
+        if trade["symbol"] == symbol and trade["timeframe"] == tf and trade["status"] == "OPEN":
+            return True
+    return False
+
+def open_paper_trade(symbol: str, tf: str, side: str, price: float, reason: str) -> None:
+    if has_open_trade(symbol, tf):
+        return
+
+    if side == "BUY":
+        sl = price * (1 - PAPER_SL_PERCENT / 100)
+        tp = price * (1 + PAPER_TP_PERCENT / 100)
+    else:
+        sl = price * (1 + PAPER_SL_PERCENT / 100)
+        tp = price * (1 - PAPER_TP_PERCENT / 100)
+
+    trade = {
+        "symbol": symbol,
+        "timeframe": tf,
+        "side": side,
+        "entry": price,
+        "sl": sl,
+        "tp": tp,
+        "entry_time": now_utc_text(),
+        "status": "OPEN",
+        "reason": reason,
+    }
+
+    paper_trades["open"].append(trade)
+    save_paper_trades()
+
+    send_alert(
+        f"📝 PAPER {side} OPENED\n"
+        f"{symbol} | {tf}m\n"
+        f"Entry: {price:.6f}\n"
+        f"SL: {sl:.6f}\n"
+        f"TP: {tp:.6f}\n"
+        f"Reason: {reason}\n"
+        f"Time: {trade['entry_time']}"
+    )
+
+def close_paper_trade(trade: dict, exit_price: float, result: str) -> None:
+    if trade["side"] == "BUY":
+        pnl_pct = ((exit_price - trade["entry"]) / trade["entry"]) * 100
+    else:
+        pnl_pct = ((trade["entry"] - exit_price) / trade["entry"]) * 100
+
+    trade["exit"] = exit_price
+    trade["exit_time"] = now_utc_text()
+    trade["result"] = result
+    trade["pnl_pct"] = pnl_pct
+    trade["status"] = "CLOSED"
+
+    paper_trades["open"] = [
+        t for t in paper_trades["open"]
+        if not (
+            t["symbol"] == trade["symbol"]
+            and t["timeframe"] == trade["timeframe"]
+            and t["entry_time"] == trade["entry_time"]
+        )
+    ]
+
+    paper_trades["closed"].append(trade)
+    save_paper_trades()
+
+    emoji = "✅" if pnl_pct >= 0 else "❌"
+
+    send_alert(
+        f"{emoji} PAPER {trade['side']} CLOSED\n"
+        f"{trade['symbol']} | {trade['timeframe']}m\n"
+        f"Entry: {trade['entry']:.6f}\n"
+        f"Exit: {exit_price:.6f}\n"
+        f"Result: {result}\n"
+        f"PnL: {pnl_pct:.2f}%\n"
+        f"Time: {trade['exit_time']}"
+    )
+
+def update_paper_trades(symbol: str, tf: str, current_price: float) -> None:
+    for trade in paper_trades["open"][:]:
+        if trade["symbol"] != symbol or trade["timeframe"] != tf or trade["status"] != "OPEN":
+            continue
+
+        if trade["side"] == "BUY":
+            if current_price <= trade["sl"]:
+                close_paper_trade(trade, current_price, "STOP LOSS")
+            elif current_price >= trade["tp"]:
+                close_paper_trade(trade, current_price, "TAKE PROFIT")
+
+        elif trade["side"] == "SELL":
+            if current_price >= trade["sl"]:
+                close_paper_trade(trade, current_price, "STOP LOSS")
+            elif current_price <= trade["tp"]:
+                close_paper_trade(trade, current_price, "TAKE PROFIT")
 
 # =========================
 # BYBIT REST HELPERS
@@ -561,6 +595,24 @@ def evaluate_symbol_tf(symbol: str, tf: str) -> None:
     if candle_signal is None:
         last_alert[symbol][tf]["candle"] = None
 
+    # ---------------- PAPER TRADE ENTRY ----------------
+    buy_signal = ema_signal == "below" and (
+        rsi_90_10_signal == "low" or rsi_95_5_signal == "low"
+    )
+
+    sell_signal = ema_signal == "above" and (
+        rsi_90_10_signal == "high" or rsi_95_5_signal == "high"
+    )
+
+    if buy_signal:
+        open_paper_trade(symbol, tf, "BUY", live_price, "EMA below extreme + RSI oversold")
+
+    if sell_signal:
+        open_paper_trade(symbol, tf, "SELL", live_price, "EMA above extreme + RSI overbought")
+
+    # ---------------- PAPER TRADE EXIT ----------------
+    update_paper_trades(symbol, tf, live_price)
+
 # =========================
 # STARTUP HISTORY LOAD
 # =========================
@@ -720,6 +772,41 @@ def show_summary(tf: str) -> None:
 
     send_alert(msg)
 
+def show_paper_summary() -> None:
+    open_count = len(paper_trades["open"])
+    closed_count = len(paper_trades["closed"])
+
+    total_pnl = 0.0
+    wins = 0
+    losses = 0
+
+    for trade in paper_trades["closed"]:
+        pnl = float(trade.get("pnl_pct", 0))
+        total_pnl += pnl
+        if pnl >= 0:
+            wins += 1
+        else:
+            losses += 1
+
+    msg = (
+        f"📝 PAPER TRADE SUMMARY\n"
+        f"Open Trades: {open_count}\n"
+        f"Closed Trades: {closed_count}\n"
+        f"Wins: {wins}\n"
+        f"Losses: {losses}\n"
+        f"Total PnL: {total_pnl:.2f}%"
+    )
+
+    if open_count > 0:
+        msg += "\n\nOpen Positions:\n"
+        for t in paper_trades["open"][:10]:
+            msg += (
+                f"{t['symbol']} | {t['timeframe']}m | {t['side']} | "
+                f"Entry: {float(t['entry']):.6f}\n"
+            )
+
+    send_alert(msg)
+
 def telegram_listener() -> None:
     global coins, removed_symbols
     last_update_id = None
@@ -774,6 +861,9 @@ def telegram_listener() -> None:
                 elif cmd == "/summary" and len(parts) == 2:
                     show_summary(parts[1])
 
+                elif cmd == "/papersummary":
+                    show_paper_summary()
+
                 elif cmd == "/refresh":
                     refresh_universe_and_data()
                     send_alert(f"🔄 Refreshed top {TOP_N_COINS} Bybit coins\nTracked coins: {len(coins)}")
@@ -791,6 +881,7 @@ def telegram_listener() -> None:
                         "/list\n"
                         "/check BTCUSDT 5\n"
                         "/summary 5\n"
+                        "/papersummary\n"
                         "/refresh\n"
                         "/remove BTCUSDT"
                     )
@@ -953,6 +1044,7 @@ def universe_refresh_loop():
 coins = rebuild_coin_universe()
 sync_tracking()
 load_initial_history(list(coins))
+save_paper_trades()
 
 threading.Thread(target=telegram_listener, daemon=True).start()
 threading.Thread(target=universe_refresh_loop, daemon=True).start()
@@ -961,13 +1053,14 @@ ws_thread = threading.Thread(target=websocket_loop, daemon=True)
 ws_thread.start()
 
 send_alert(
-    f"🚨 HYBRID STRATEGY BOT RUNNING 🚨\n"
+    f"🚨 HYBRID PAPER TRADING BOT RUNNING 🚨\n"
     f"Tracked coins: {len(coins)}\n"
     f"Mode: Top {TOP_N_COINS} Bybit linear coins by 24h turnover\n"
     f"Timeframes: 5m / 15m / 60m\n"
     f"EMA Standard: ±{EXTREME_EMA_DISTANCE_PERCENT:.2f}% from EMA200\n"
     f"RSI: 90/10 and 95/5 using Wilder RSI on closed candle\n"
     f"Giant Candle: 5m/15m/1h = 10x to 15x\n"
+    f"Paper Trading: ON\n"
     f"Data source: Bybit REST + Bybit WebSocket"
 )
 
