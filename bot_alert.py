@@ -1,3 +1,7 @@
+# =========================
+# 🚀 FINAL FULL BOT (WEBSOCKET + 2/3 CONFLUENCE)
+# =========================
+
 import json
 import os
 import threading
@@ -28,10 +32,10 @@ BYBIT_WS_LINEAR = "wss://stream.bybit.com/v5/public/linear"
 # SETTINGS
 # =========================
 TIMEFRAMES = ["5", "60"]
-TOP_N_COINS = 100
+TOP_N_COINS = 50
 
-RSI_OVERBOUGHT = 70.0
-RSI_OVERSOLD = 30.0
+RSI_OVERBOUGHT = 70
+RSI_OVERSOLD = 30
 RSI_PERIOD = 14
 
 PAPER_TRADES_FILE = "paper_trades.json"
@@ -47,12 +51,12 @@ market_data = defaultdict(lambda: defaultdict(dict))
 paper_trades = {"open": [], "closed": []}
 
 # =========================
-# HELPERS
+# UTILS
 # =========================
-def now_utc_text():
+def now():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
-def send_alert(msg):
+def send(msg):
     try:
         session.get(
             f"{TELEGRAM_URL}/sendMessage",
@@ -63,84 +67,95 @@ def send_alert(msg):
         pass
 
 # =========================
-# DATA
+# DATA FETCH
 # =========================
-def get_ohlc(symbol, interval):
-    r = session.get(
-        BYBIT_KLINE_URL,
-        params={"category": "linear", "symbol": symbol, "interval": interval, "limit": 200},
-    )
-    rows = r.json()["result"]["list"]
-    rows.reverse()
+def get_ohlc(symbol, tf):
+    try:
+        r = session.get(BYBIT_KLINE_URL, params={
+            "category": "linear",
+            "symbol": symbol,
+            "interval": tf,
+            "limit": 200
+        }, timeout=10)
 
-    df = pd.DataFrame(rows, columns=["time","open","high","low","close","volume","turnover"])
-    for c in df.columns:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
+        rows = r.json()["result"]["list"]
+        rows.reverse()
 
-    return df.dropna()
+        df = pd.DataFrame(rows, columns=["time","open","high","low","close","volume","turnover"])
+
+        for c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+        return df.dropna()
+    except:
+        return None
 
 # =========================
 # INDICATORS
 # =========================
-def calculate_rsi(close, period=14):
-    delta = close.diff()
+def rsi(series):
+    delta = series.diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
-
-    avg_gain = gain.ewm(alpha=1/period).mean()
-    avg_loss = loss.ewm(alpha=1/period).mean()
-
+    avg_gain = gain.ewm(alpha=1/RSI_PERIOD).mean()
+    avg_loss = loss.ewm(alpha=1/RSI_PERIOD).mean()
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
-def calculate_atr(df, period=14):
-    hl = df["high"] - df["low"]
-    hc = (df["high"] - df["close"].shift()).abs()
-    lc = (df["low"] - df["close"].shift()).abs()
-    tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
-    return tr.rolling(period).mean()
+def atr(df):
+    tr = pd.concat([
+        df["high"] - df["low"],
+        (df["high"] - df["close"].shift()).abs(),
+        (df["low"] - df["close"].shift()).abs()
+    ], axis=1).max(axis=1)
+    return tr.rolling(14).mean()
 
 def add_indicators(df):
     df["EMA200"] = df["close"].ewm(span=200).mean()
-    df["RSI"] = calculate_rsi(df["close"])
+    df["RSI"] = rsi(df["close"])
     df["body"] = (df["close"] - df["open"]).abs()
     df["avg_body"] = df["body"].rolling(20).mean()
     return df
 
 # =========================
-# STRATEGY
+# SIGNAL (2/3 CONFLUENCE)
 # =========================
-def generate_signal(symbol):
-    df5 = market_data[symbol]["5"]
-    df1h = market_data[symbol]["60"]
+def get_signal(symbol):
+    df = market_data[symbol]["5"]
 
-    if df5 is None or df1h is None:
+    if df is None or len(df) < 50:
         return None
 
-    df5 = add_indicators(df5.copy())
-    df1h = add_indicators(df1h.copy())
+    df = add_indicators(df.copy())
 
-    if len(df5) < 3:
-        return None
+    signals = []
 
-    rsi = df5["RSI"].iloc[-2]
-    prev = df5["RSI"].iloc[-3]
+    price = df["close"].iloc[-1]
+    ema = df["EMA200"].iloc[-1]
 
-    price_1h = df1h["close"].iloc[-1]
-    ema_1h = df1h["EMA200"].iloc[-1]
+    # EMA
+    signals.append("BUY" if price > ema else "SELL")
 
-    trend_up = price_1h > ema_1h
-    trend_down = price_1h < ema_1h
+    # RSI
+    r = df["RSI"].iloc[-2]
+    if r < RSI_OVERSOLD:
+        signals.append("BUY")
+    elif r > RSI_OVERBOUGHT:
+        signals.append("SELL")
 
-    body = df5["body"].iloc[-1]
-    avg_body = df5["avg_body"].iloc[-2]
+    # Candle
+    body = df["body"].iloc[-1]
+    avg = df["avg_body"].iloc[-2]
 
-    momentum = avg_body > 0 and body > avg_body
+    if avg > 0 and body > avg:
+        if df["close"].iloc[-1] > df["open"].iloc[-1]:
+            signals.append("BUY")
+        else:
+            signals.append("SELL")
 
-    if trend_up and prev < RSI_OVERSOLD and rsi > RSI_OVERSOLD and momentum:
+    if signals.count("BUY") >= 2:
         return "BUY"
-
-    if trend_down and prev > RSI_OVERBOUGHT and rsi < RSI_OVERBOUGHT and momentum:
+    if signals.count("SELL") >= 2:
         return "SELL"
 
     return None
@@ -149,17 +164,11 @@ def generate_signal(symbol):
 # PAPER TRADING
 # =========================
 def open_trade(symbol, side, price):
-    df = market_data[symbol]["5"]
-    df = add_indicators(df.copy())
+    df = add_indicators(market_data[symbol]["5"].copy())
+    a = atr(df).iloc[-1]
 
-    atr = calculate_atr(df).iloc[-1]
-
-    if side == "BUY":
-        sl = price - atr * 0.5
-        tp = price + atr * 1.0
-    else:
-        sl = price + atr * 0.5
-        tp = price - atr * 1.0
+    sl = price - a*0.5 if side == "BUY" else price + a*0.5
+    tp = price + a*1.0 if side == "BUY" else price - a*1.0
 
     trade = {
         "symbol": symbol,
@@ -167,11 +176,12 @@ def open_trade(symbol, side, price):
         "entry": price,
         "sl": sl,
         "tp": tp,
+        "time": now()
     }
 
     paper_trades["open"].append(trade)
 
-    send_alert(f"{side} {symbol} @ {price:.4f}")
+    send(f"📝 {side} {symbol}\nEntry: {price:.4f}\nSL: {sl:.4f}\nTP: {tp:.4f}")
 
 def update_trades(symbol, price):
     for t in paper_trades["open"][:]:
@@ -181,36 +191,120 @@ def update_trades(symbol, price):
         if t["side"] == "BUY":
             if price <= t["sl"] or price >= t["tp"]:
                 paper_trades["open"].remove(t)
+                send(f"✅ CLOSED {symbol}")
         else:
             if price >= t["sl"] or price <= t["tp"]:
                 paper_trades["open"].remove(t)
+                send(f"✅ CLOSED {symbol}")
 
 # =========================
-# MAIN LOOP (SIMPLIFIED)
+# UNIVERSE
 # =========================
-def run():
-    global coins
+def get_top_coins():
+    r = session.get(BYBIT_TICKERS_URL, params={"category": "linear"})
+    data = r.json()["result"]["list"]
 
-    coins = ["BTCUSDT", "ETHUSDT"]
+    ranked = sorted(data, key=lambda x: float(x["turnover24h"]), reverse=True)
+    return [c["symbol"] for c in ranked[:TOP_N_COINS]]
 
-    while True:
-        for sym in coins:
+# =========================
+# WEBSOCKET
+# =========================
+def on_message(ws, message):
+    msg = json.loads(message)
+    topic = msg.get("topic")
+
+    if not topic or "kline" not in topic:
+        return
+
+    parts = topic.split(".")
+    tf = parts[1]
+    symbol = parts[2]
+
+    candle = msg["data"][0]
+
+    row = {
+        "time": int(candle["start"]),
+        "open": float(candle["open"]),
+        "high": float(candle["high"]),
+        "low": float(candle["low"]),
+        "close": float(candle["close"]),
+        "volume": float(candle["volume"]),
+        "turnover": float(candle["turnover"]),
+    }
+
+    with data_lock:
+        df = market_data[symbol][tf]
+
+        if df is None or len(df) == 0:
+            return
+
+        if candle["confirm"]:
+            df = pd.concat([df, pd.DataFrame([row])]).tail(200)
+            market_data[symbol][tf] = df
+
+            # === ALERTS (independent) ===
+            df_ind = add_indicators(df.copy())
+
+            price = df_ind["close"].iloc[-1]
+            ema = df_ind["EMA200"].iloc[-1]
+            rsi_val = df_ind["RSI"].iloc[-2]
+
+            # EMA alert
+            if abs((price - ema)/ema*100) > 2:
+                send(f"EMA ALERT {symbol} {tf}")
+
+            # RSI alert
+            if rsi_val < RSI_OVERSOLD:
+                send(f"RSI OVERSOLD {symbol} {tf}")
+            elif rsi_val > RSI_OVERBOUGHT:
+                send(f"RSI OVERBOUGHT {symbol} {tf}")
+
+            # Candle alert
+            body = df_ind["body"].iloc[-1]
+            avg = df_ind["avg_body"].iloc[-2]
+            if avg > 0 and body > avg * 2:
+                send(f"GIANT CANDLE {symbol} {tf}")
+
+            # === TRADING (ONLY 5m) ===
+            if tf == "5":
+                signal = get_signal(symbol)
+
+                if signal:
+                    open_trade(symbol, signal, price)
+
+                update_trades(symbol, price)
+
+def start_ws():
+    ws = websocket.WebSocketApp(
+        BYBIT_WS_LINEAR,
+        on_message=on_message
+    )
+
+    def on_open(ws):
+        topics = []
+        for c in coins:
             for tf in TIMEFRAMES:
-                df = get_ohlc(sym, tf)
-                market_data[sym][tf] = df
+                topics.append(f"kline.{tf}.{c}")
 
-            signal = generate_signal(sym)
-            price = market_data[sym]["5"]["close"].iloc[-1]
+        ws.send(json.dumps({"op": "subscribe", "args": topics}))
 
-            if signal:
-                open_trade(sym, signal, price)
-
-            update_trades(sym, price)
-
-        time.sleep(30)
+    ws.on_open = on_open
+    ws.run_forever()
 
 # =========================
 # START
 # =========================
-send_alert("🚀 Bot started (5m + 1h confluence)")
-run()
+coins = get_top_coins()
+
+# preload data
+for c in coins:
+    for tf in TIMEFRAMES:
+        market_data[c][tf] = get_ohlc(c, tf)
+
+send(f"🚀 FULL BOT RUNNING\nCoins: {len(coins)}\nMode: 2/3 Confluence")
+
+threading.Thread(target=start_ws).start()
+
+while True:
+    time.sleep(60)
