@@ -223,9 +223,11 @@ def on_message(ws, message):
             send(f"RSI OVERBOUGHT {symbol} {tf}")
 
         if tf == "5":
-            signal = get_signal(df)
-            if signal:
-                open_trade(symbol, signal, price)
+    # 🔥 FORCE SIGNAL (TEST MODE)
+    import random
+    signal = random.choice(["BUY", "SELL"])
+
+    open_trade(symbol, signal, price)
 
         check_trades(price)
 
