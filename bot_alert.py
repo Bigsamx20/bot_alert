@@ -1,5 +1,6 @@
+
 # =========================
-# 🚀 PAPER TRADING BOT (FIXED + DEBUG)
+# 🚀 REAL-TIME TEST BOT (NO DELAY)
 # =========================
 
 import json
@@ -9,9 +10,10 @@ import requests
 import pandas as pd
 from collections import defaultdict
 import websocket
+import random
 
 # =========================
-# 🔴 INSERT YOUR DETAILS HERE
+# 🔴 PUT YOUR DETAILS HERE
 # =========================
 TOKEN = "8276758800:AAFGXPI4q4xsZgAbpDqq_PDEsCYu94jaVXs"
 CHAT_ID = "6903033357"
@@ -22,16 +24,13 @@ CHAT_ID = "6903033357"
 WS_URL = "wss://stream.bybit.com/v5/public/linear"
 
 SYMBOLS = ["BTCUSDT"]
-TIMEFRAMES = ["5", "60"]
+TIMEFRAMES = ["1"]  # FAST TEST
 
 ACCOUNT_SIZE = 100
 LEVERAGE = 10
 
 TP_PERCENT = 0.05
 SL_PERCENT = 0.02
-
-RSI_OB = 70
-RSI_OS = 30
 
 # =========================
 # STATE
@@ -40,116 +39,47 @@ market_data = defaultdict(lambda: defaultdict(pd.DataFrame))
 open_trades = []
 
 # =========================
-# TELEGRAM (WITH DEBUG)
+# TELEGRAM
 # =========================
 def send(msg):
     try:
-        r = requests.get(
+        requests.get(
             f"https://api.telegram.org/bot{TOKEN}/sendMessage",
             params={"chat_id": CHAT_ID, "text": msg}
         )
-        print("Telegram:", r.text)
     except Exception as e:
         print("Telegram error:", e)
 
 # =========================
-# INDICATORS
+# POSITION
 # =========================
-def rsi(series):
-    delta = series.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.ewm(alpha=1/14).mean()
-    avg_loss = loss.ewm(alpha=1/14).mean()
-    rs = avg_gain / avg_loss
-    return 100 - (100/(1+rs))
-
-def add_indicators(df):
-    df["EMA"] = df["close"].ewm(span=200).mean()
-    df["RSI"] = rsi(df["close"])
-    df["body"] = (df["close"] - df["open"]).abs()
-    df["avg_body"] = df["body"].rolling(20).mean()
-    df["vol_avg"] = df["volume"].rolling(20).mean()
-    return df
-
-# =========================
-# POSITION LOGIC
-# =========================
-def calc_position_value():
+def position_size():
     return ACCOUNT_SIZE * LEVERAGE
 
 def get_tp_sl(entry, side):
     if side == "BUY":
-        tp = entry * (1 + TP_PERCENT)
-        sl = entry * (1 - SL_PERCENT)
+        return entry * 1.05, entry * 0.98
     else:
-        tp = entry * (1 - TP_PERCENT)
-        sl = entry * (1 + SL_PERCENT)
-    return tp, sl
+        return entry * 0.95, entry * 1.02
 
 # =========================
-# SIGNAL (2/3)
+# TRADES
 # =========================
-def get_signal(df):
-    df = add_indicators(df.copy())
-
-    signals = []
-
-    price = df["close"].iloc[-1]
-    ema = df["EMA"].iloc[-1]
-
-    signals.append("BUY" if price > ema else "SELL")
-
-    r = df["RSI"].iloc[-2]
-    if r < RSI_OS:
-        signals.append("BUY")
-    elif r > RSI_OB:
-        signals.append("SELL")
-
-    body = df["body"].iloc[-1]
-    avg = df["avg_body"].iloc[-2]
-
-    if avg > 0 and body > avg:
-        if df["close"].iloc[-1] > df["open"].iloc[-1]:
-            signals.append("BUY")
-        else:
-            signals.append("SELL")
-
-    vol = df["volume"].iloc[-1]
-    vol_avg = df["vol_avg"].iloc[-1]
-
-    if vol < vol_avg:
-        return None
-
-    if signals.count("BUY") >= 2:
-        return "BUY"
-    if signals.count("SELL") >= 2:
-        return "SELL"
-
-    return None
-
-# =========================
-# PAPER TRADING
-# =========================
-def open_trade(symbol, side, entry):
-    position = calc_position_value()
-    tp, sl = get_tp_sl(entry, side)
+def open_trade(symbol, side, price):
+    tp, sl = get_tp_sl(price, side)
 
     trade = {
         "symbol": symbol,
         "side": side,
-        "entry": entry,
+        "entry": price,
         "tp": tp,
         "sl": sl,
-        "position": position,
         "status": "OPEN"
     }
 
     open_trades.append(trade)
 
-    send(
-        f"📝 OPEN\n{side} {symbol}\nEntry: {entry:.2f}\nTP: {tp:.2f}\nSL: {sl:.2f}"
-    )
+    send(f"📝 OPEN {side} {symbol}\nEntry: {price:.2f}\nTP: {tp:.2f}\nSL: {sl:.2f}")
 
 def check_trades(price):
     for trade in open_trades[:]:
@@ -157,31 +87,29 @@ def check_trades(price):
 
         if side == "BUY":
             if price >= trade["tp"]:
-                pnl = TP_PERCENT * trade["position"]
+                pnl = TP_PERCENT * position_size()
                 close_trade(trade, price, pnl, "TP")
             elif price <= trade["sl"]:
-                pnl = -(SL_PERCENT * trade["position"])
+                pnl = -SL_PERCENT * position_size()
                 close_trade(trade, price, pnl, "SL")
+
         else:
             if price <= trade["tp"]:
-                pnl = TP_PERCENT * trade["position"]
+                pnl = TP_PERCENT * position_size()
                 close_trade(trade, price, pnl, "TP")
             elif price >= trade["sl"]:
-                pnl = -(SL_PERCENT * trade["position"])
+                pnl = -SL_PERCENT * position_size()
                 close_trade(trade, price, pnl, "SL")
 
 def close_trade(trade, price, pnl, reason):
-    send(
-        f"✅ CLOSED {trade['symbol']}\n"
-        f"{trade['side']}\nExit: {price:.2f}\nPnL: ${pnl:.2f}\nReason: {reason}"
-    )
+    send(f"✅ CLOSED {trade['symbol']} {trade['side']}\nExit: {price:.2f}\nPnL: ${pnl:.2f}\n{reason}")
     open_trades.remove(trade)
 
 # =========================
 # WEBSOCKET
 # =========================
 def on_message(ws, message):
-    print("WS MESSAGE RECEIVED")
+    print("DATA RECEIVED")
 
     msg = json.loads(message)
     topic = msg.get("topic")
@@ -195,44 +123,19 @@ def on_message(ws, message):
 
     candle = msg["data"][0]
 
-    row = {
-        "open": float(candle["open"]),
-        "close": float(candle["close"]),
-        "high": float(candle["high"]),
-        "low": float(candle["low"]),
-        "volume": float(candle["volume"]),
-    }
+    price = float(candle["close"])
 
-    df = market_data[symbol][tf]
+    # 🚀 LIVE UPDATE MESSAGE
+    send(f"📡 {symbol} {tf} PRICE: {price:.2f}")
 
-    if df is None or df.empty:
-        market_data[symbol][tf] = pd.DataFrame([row])
-        return
-
-    if candle["confirm"]:
-        df = pd.concat([df, pd.DataFrame([row])]).tail(200)
-        market_data[symbol][tf] = df
-
-        df_ind = add_indicators(df.copy())
-        price = df_ind["close"].iloc[-1]
-
-        r = df_ind["RSI"].iloc[-2]
-        if r < RSI_OS:
-            send(f"RSI OVERSOLD {symbol} {tf}")
-        elif r > RSI_OB:
-            send(f"RSI OVERBOUGHT {symbol} {tf}")
-
-        if tf == "1":
-    # 🔥 FORCE SIGNAL (TEST MODE)
-    import random
+    # 🚀 FORCE TRADE EVERY MESSAGE
     signal = random.choice(["BUY", "SELL"])
-
     open_trade(symbol, signal, price)
 
-        check_trades(price)
+    check_trades(price)
 
 # =========================
-# START
+# START WS
 # =========================
 def start_ws():
     ws = websocket.WebSocketApp(
@@ -241,14 +144,22 @@ def start_ws():
     )
 
     def on_open(ws):
-        args = [f"kline.{tf}.{s}" for s in SYMBOLS for tf in TIMEFRAMES]
+        args = []
+        for s in SYMBOLS:
+            for tf in TIMEFRAMES:
+                args.append(f"kline.{tf}.{s}")
+
         ws.send(json.dumps({"op": "subscribe", "args": args}))
+        print("WS CONNECTED")
 
     ws.on_open = on_open
     ws.run_forever()
 
+# =========================
+# START BOT
+# =========================
 print("BOT STARTING...")
-send("🚀 BOT STARTED")
+send("🚀 TEST BOT RUNNING (FAST MODE)")
 
 threading.Thread(target=start_ws).start()
 
