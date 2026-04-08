@@ -222,7 +222,7 @@ def on_message(ws, message):
         elif r > RSI_OB:
             send(f"RSI OVERBOUGHT {symbol} {tf}")
 
-        if tf == "5":
+        if tf == "1":
     # 🔥 FORCE SIGNAL (TEST MODE)
     import random
     signal = random.choice(["BUY", "SELL"])
