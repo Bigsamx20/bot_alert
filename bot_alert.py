@@ -5,12 +5,16 @@ import requests
 import pandas as pd
 from collections import defaultdict
 import websocket
+import os
 
 # =========================
-# 🔴 YOUR DETAILS
+# 🔴 LOAD FROM ENVIRONMENT
 # =========================
-TOKEN = "8276758800:AAFGXPI4q4xsZgAbpDqq_PDEsCYu94jaVXs"
-CHAT_ID = "6903033357"
+TOKEN = os.getenv("TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
+
+if not TOKEN or not CHAT_ID:
+    print("⚠️ ERROR: TOKEN or CHAT_ID missing from environment variables!")
 
 # =========================
 # CONFIG
@@ -30,9 +34,8 @@ LEVERAGE = 10
 TP_PERCENT = 0.05
 SL_PERCENT = 0.02
 
-EMA_DISTANCE_THRESHOLD = 0.05  # 5%
-
-COOLDOWN = 60  # seconds between trades per symbol
+EMA_DISTANCE_THRESHOLD = 0.05
+COOLDOWN = 60
 
 # =========================
 # STATE
@@ -45,13 +48,17 @@ last_trade_time = defaultdict(int)
 # TELEGRAM
 # =========================
 def send(msg):
+    if not TOKEN or not CHAT_ID:
+        print("⚠️ Cannot send Telegram message — missing TOKEN or CHAT_ID")
+        return
+
     try:
         requests.get(
             f"https://api.telegram.org/bot{TOKEN}/sendMessage",
             params={"chat_id": CHAT_ID, "text": msg}
         )
-    except:
-        pass
+    except Exception as e:
+        print(f"Telegram error: {e}")
 
 # =========================
 # INDICATORS
@@ -78,15 +85,11 @@ def giant_candle(df):
         return None
 
     last = df.iloc[-1]
-
     avg_size = (df["high"] - df["low"]).rolling(20).mean().iloc[-1]
     candle_size = last["high"] - last["low"]
 
-    if candle_size > 12 * avg_size:  # 🔥 12x (you can push to 15x)
-        if last["close"] > last["open"]:
-            return "BUY"
-        else:
-            return "SELL"
+    if candle_size > 12 * avg_size:
+        return "BUY" if last["close"] > last["open"] else "SELL"
 
     return None
 
@@ -96,7 +99,6 @@ def ema_distance(df):
 
     ema200 = ema(df).iloc[-1]
     price = df["close"].iloc[-1]
-
     distance = (price - ema200) / ema200
 
     if distance > EMA_DISTANCE_THRESHOLD:
@@ -151,7 +153,6 @@ def open_trade(symbol, side, price):
     if time.time() - last_trade_time[symbol] < COOLDOWN:
         return
 
-    # only 1 trade per symbol
     for t in open_trades:
         if t["symbol"] == symbol:
             return
@@ -173,11 +174,13 @@ def open_trade(symbol, side, price):
 
 def close_trade(trade, price, reason):
     pnl = (price - trade["entry"]) / trade["entry"] * position_size()
-
     if trade["side"] == "SELL":
         pnl *= -1
 
-    send(f"✅ CLOSED {trade['symbol']} {trade['side']}\nExit: {price:.2f}\nPnL: ${pnl:.2f}\n{reason}")
+    send(
+        f"✅ CLOSED {trade['symbol']} {trade['side']}\n"
+        f"Exit: {price:.2f}\nPnL: ${pnl:.2f}\n{reason}"
+    )
 
     open_trades.remove(trade)
 
@@ -212,14 +215,12 @@ def on_message(ws, message):
     symbol = parts[2]
 
     candle = msg["data"][0]
-
     if not candle["confirm"]:
         return
 
     price = float(candle["close"])
 
     df = market_data[symbol][tf]
-
     new_row = {
         "open": float(candle["open"]),
         "high": float(candle["high"]),
@@ -231,7 +232,6 @@ def on_message(ws, message):
     df = pd.concat([df, pd.DataFrame([new_row])]).tail(300)
     market_data[symbol][tf] = df
 
-    # ===== STRATEGIES =====
     sig1 = giant_candle(df)
     sig2 = ema_distance(df)
     sig3 = rsi_signal(df)
@@ -244,7 +244,6 @@ def on_message(ws, message):
         send(f"📊 RSI {symbol}: {sig3}")
 
     final_signal = confluence([sig1, sig2, sig3])
-
     if final_signal:
         send(f"🚀 CONFLUENCE {symbol} {tf}: {final_signal}")
         open_trade(symbol, final_signal, price)
