@@ -1,3 +1,4 @@
 requests
 pandas
 websocket-client
+numpy
