@@ -12,7 +12,7 @@ import websocket
 # CONFIG
 # =========================
 TOKEN = os.getenv("8276758800:AAGI08u6pEWslgYfVX7i92xhCluiDhGT7Gk")
-CHAT_ID = os.getenv("6903033357)
+CHAT_ID = os.getenv("6903033357")
 
 WS_URL = "wss://stream.bybit.com/v5/public/linear"
 
