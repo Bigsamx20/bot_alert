@@ -380,11 +380,12 @@ def on_open(ws):
     print("SUBSCRIBED TO:", args)
 
 # ============================================================
-# STEP 11 — WEBSOCKET RUNNER
+# STEP 11 — WEBSOCKET RUNNER (FINAL FIXED VERSION)
 # ============================================================
 
 def start_ws():
     print("STARTING WEBSOCKET...")
+
     ws = websocket.WebSocketApp(
         WS_URL,
         on_message=on_message,
@@ -392,7 +393,22 @@ def start_ws():
         on_close=on_close,
     )
     ws.on_open = on_open
-    ws.run_forever(ping_interval=20, ping_timeout=10)
+
+    import threading
+
+    # Start WebSocket in background thread
+    wst = threading.Thread(
+        target=ws.run_forever,
+        kwargs={"ping_interval": 20, "ping_timeout": 10}
+    )
+    wst.daemon = True
+    wst.start()
+
+    print("WEBSOCKET THREAD STARTED")
+
+    # Keep main thread alive forever
+    while True:
+        time.sleep(1)
 
 # ============================================================
 # STEP 12 — MAIN LOOP
