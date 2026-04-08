@@ -21,15 +21,12 @@ print("CHAT_ID LOADED:", CHAT_ID is not None)
 # STEP 2 — CONFIGURATION
 # ============================================================
 
-# Symbols and timeframes to trade
 SYMBOLS = ["BTCUSDT", "ETHUSDT"]
 TIMEFRAMES = ["1m", "5m", "15m"]
 
-# Confluence config
-PRIMARY_TF = "1m"   # execution timeframe
-CONFIRM_TF = "5m"   # confirmation timeframe
+PRIMARY_TF = "1m"
+CONFIRM_TF = "5m"
 
-# Indicator settings
 EMA_FAST = 9
 EMA_SLOW = 21
 RSI_PERIOD = 14
@@ -37,20 +34,15 @@ MACD_FAST = 12
 MACD_SLOW = 26
 MACD_SIGNAL = 9
 
-# Paper trading config
 PAPER_BALANCE = 10_000.0
-RISK_PER_TRADE = 0.01  # 1% per trade
+RISK_PER_TRADE = 0.01
 
-# WebSocket endpoint (Bybit spot public)
 WS_URL = "wss://stream.bybit.com/v5/public/spot"
 
-# Store candles per (symbol, timeframe)
-candles = {}          # {(symbol, tf): DataFrame}
-positions = {}        # {symbol: {"side": "LONG", "entry": float, "size": float}}
+candles = {}
+positions = {}
 paper_balance = PAPER_BALANCE
-
-# Last combo signal per (symbol, timeframe)
-last_combo_signals = {}  # {(symbol, tf): "BUY"/"SELL"/None}
+last_combo_signals = {}
 
 # ============================================================
 # STEP 3 — TELEGRAM UTILITIES
@@ -72,9 +64,6 @@ def send_telegram(msg: str):
 def log_and_alert(msg: str):
     print(msg)
     send_telegram(msg)
-
-
-send_telegram("🚀 BOT RUNNING (EMA + RSI + MACD + CONFLUENCE + LARGE CANDLE)")
 
 # ============================================================
 # STEP 4 — INDICATOR CALCULATIONS
@@ -104,19 +93,10 @@ def calc_macd(series: pd.Series, fast: int, slow: int, signal: int):
     return macd, signal_line, hist
 
 # ============================================================
-# STEP 5 — SIGNAL GENERATION (INDEPENDENT + CONFLUENCE)
+# STEP 5 — SIGNAL GENERATION
 # ============================================================
 
 def generate_signals(df: pd.DataFrame):
-    """
-    Returns dict:
-    {
-      "ema": "BUY"/"SELL"/None,
-      "rsi": "BUY"/"SELL"/None,
-      "macd": "BUY"/"SELL"/None,
-      "combo": "BUY"/"SELL"/None
-    }
-    """
     min_len = max(EMA_SLOW, RSI_PERIOD, MACD_SLOW + MACD_SIGNAL)
     if len(df) < min_len:
         return {"ema": None, "rsi": None, "macd": None, "combo": None}
@@ -138,7 +118,6 @@ def generate_signals(df: pd.DataFrame):
     macd_val = last["macd"]
     macd_signal = last["macd_signal"]
 
-    # --- EMA signal ---
     if ema_fast > ema_slow:
         ema_sig = "BUY"
     elif ema_fast < ema_slow:
@@ -146,7 +125,6 @@ def generate_signals(df: pd.DataFrame):
     else:
         ema_sig = None
 
-    # --- RSI signal (simple midline logic) ---
     if rsi > 55:
         rsi_sig = "BUY"
     elif rsi < 45:
@@ -154,7 +132,6 @@ def generate_signals(df: pd.DataFrame):
     else:
         rsi_sig = None
 
-    # --- MACD signal ---
     if macd_val > macd_signal:
         macd_sig = "BUY"
     elif macd_val < macd_signal:
@@ -162,7 +139,6 @@ def generate_signals(df: pd.DataFrame):
     else:
         macd_sig = None
 
-    # --- Combo confluence: all three agree ---
     if ema_sig == rsi_sig == macd_sig and ema_sig is not None:
         combo_sig = ema_sig
     else:
@@ -180,10 +156,6 @@ def generate_signals(df: pd.DataFrame):
 # ============================================================
 
 def detect_large_candle(df: pd.DataFrame):
-    """
-    Detects if the latest candle range is >= 12x the previous candle range.
-    Returns ratio (float) or None.
-    """
     if len(df) < 2:
         return None
 
@@ -249,9 +221,6 @@ def close_position(symbol: str, price: float):
 
 
 def execute_combo_trade(symbol: str, combo_signal: str, price: float):
-    """
-    Execute paper trades based on combo signal (after multi-timeframe confluence).
-    """
     pos = get_position(symbol)
 
     if combo_signal == "BUY":
@@ -280,15 +249,8 @@ def get_last_combo(symbol: str, tf: str):
 
 
 def process_confluence(symbol: str, tf: str, combo_signal: str, price: float):
-    """
-    - Combo signal is already EMA+RSI+MACD confluence on a single timeframe.
-    - Here we add multi-timeframe confluence:
-      Only trade when PRIMARY_TF combo == CONFIRM_TF combo.
-    """
-    # Always alert combo signal per timeframe
     log_and_alert(f"🔔 COMBO {combo_signal} | {symbol} {tf} | Price: {price:.4f}")
 
-    # Only trade on primary timeframe
     if tf != PRIMARY_TF:
         return
 
@@ -309,9 +271,6 @@ def process_confluence(symbol: str, tf: str, combo_signal: str, price: float):
 # ============================================================
 
 def update_candles(symbol: str, tf: str, kline: dict):
-    """
-    kline is Bybit v5 kline payload.
-    """
     key = (symbol, tf)
 
     start_time = int(kline["start"]) / 1000
@@ -359,7 +318,7 @@ def on_message(ws, message):
     if "topic" not in data or "data" not in data:
         return
 
-    topic = data["topic"]  # e.g. "kline.1m.BTCUSDT"
+    topic = data["topic"]
     parts = topic.split(".")
     if len(parts) != 3:
         return
@@ -368,12 +327,10 @@ def on_message(ws, message):
 
     for kline in data["data"]:
         if kline.get("confirm") is not True:
-            # only act on closed candles
             continue
 
         df = update_candles(symbol, tf, kline)
 
-        # --- LARGE CANDLE ALERT ---
         ratio = detect_large_candle(df)
         if ratio:
             log_and_alert(
@@ -381,11 +338,9 @@ def on_message(ws, message):
                 f"Range expanded massively vs previous candle."
             )
 
-        # --- INDICATOR SIGNALS ---
         signals = generate_signals(df)
         price = float(kline["close"])
 
-        # Independent alerts
         if signals["ema"]:
             log_and_alert(
                 f"📊 EMA {signals['ema']} | {symbol} {tf} | Price: {price:.4f}"
@@ -399,7 +354,6 @@ def on_message(ws, message):
                 f"📊 MACD {signals['macd']} | {symbol} {tf} | Price: {price:.4f}"
             )
 
-        # Combo (EMA+RSI+MACD)
         combo = signals["combo"]
         set_last_combo(symbol, tf, combo)
 
@@ -446,6 +400,7 @@ def start_ws():
 
 if __name__ == "__main__":
     print("BOT STARTING MAIN LOOP...")
+    send_telegram("🚀 BOT RUNNING (EMA + RSI + MACD + CONFLUENCE + LARGE CANDLE)")
     while True:
         try:
             start_ws()
