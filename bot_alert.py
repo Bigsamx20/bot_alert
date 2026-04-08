@@ -1,94 +1,50 @@
 # =========================
-# 🚀 FINAL FULL BOT (WEBSOCKET + 2/3 CONFLUENCE)
+# 🚀 PAPER TRADING BOT (TELEGRAM ONLY)
 # =========================
 
-import json
-import os
-import threading
-import time
-from collections import defaultdict
-from datetime import datetime, timezone
-
-import pandas as pd
+import os, json, time, threading
 import requests
+import pandas as pd
+from collections import defaultdict
 import websocket
 
 # =========================
 # CONFIG
 # =========================
-TOKEN = os.getenv("TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
+TOKEN = os.getenv("8276758800:AAGI08u6pEWslgYfVX7i92xhCluiDhGT7Gk")
+CHAT_ID = os.getenv("6903033357)
 
-if not TOKEN or not CHAT_ID:
-    raise SystemExit("Missing TOKEN or CHAT_ID environment variables.")
+WS_URL = "wss://stream.bybit.com/v5/public/linear"
 
-TELEGRAM_URL = f"https://api.telegram.org/bot{TOKEN}"
-BYBIT_KLINE_URL = "https://api.bybit.com/v5/market/kline"
-BYBIT_INSTRUMENTS_URL = "https://api.bybit.com/v5/market/instruments-info"
-BYBIT_TICKERS_URL = "https://api.bybit.com/v5/market/tickers"
-BYBIT_WS_LINEAR = "wss://stream.bybit.com/v5/public/linear"
-
-# =========================
-# SETTINGS
-# =========================
+SYMBOLS = ["BTCUSDT"]
 TIMEFRAMES = ["5", "60"]
-TOP_N_COINS = 50
 
-RSI_OVERBOUGHT = 70
-RSI_OVERSOLD = 30
-RSI_PERIOD = 14
+ACCOUNT_SIZE = 100
+LEVERAGE = 10
 
-PAPER_TRADES_FILE = "paper_trades.json"
+TP_PERCENT = 0.05
+SL_PERCENT = 0.02
+
+RSI_OB = 70
+RSI_OS = 30
 
 # =========================
 # STATE
 # =========================
-session = requests.Session()
-data_lock = threading.Lock()
-
-coins = []
-market_data = defaultdict(lambda: defaultdict(dict))
-paper_trades = {"open": [], "closed": []}
+market_data = defaultdict(lambda: defaultdict(pd.DataFrame))
+open_trades = []
 
 # =========================
-# UTILS
+# TELEGRAM
 # =========================
-def now():
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-
 def send(msg):
     try:
-        session.get(
-            f"{TELEGRAM_URL}/sendMessage",
-            params={"chat_id": CHAT_ID, "text": msg},
-            timeout=10,
+        requests.get(
+            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+            params={"chat_id": CHAT_ID, "text": msg}
         )
     except:
         pass
-
-# =========================
-# DATA FETCH
-# =========================
-def get_ohlc(symbol, tf):
-    try:
-        r = session.get(BYBIT_KLINE_URL, params={
-            "category": "linear",
-            "symbol": symbol,
-            "interval": tf,
-            "limit": 200
-        }, timeout=10)
-
-        rows = r.json()["result"]["list"]
-        rows.reverse()
-
-        df = pd.DataFrame(rows, columns=["time","open","high","low","close","volume","turnover"])
-
-        for c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-
-        return df.dropna()
-    except:
-        return None
 
 # =========================
 # INDICATORS
@@ -97,50 +53,53 @@ def rsi(series):
     delta = series.diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
-    avg_gain = gain.ewm(alpha=1/RSI_PERIOD).mean()
-    avg_loss = loss.ewm(alpha=1/RSI_PERIOD).mean()
+    avg_gain = gain.ewm(alpha=1/14).mean()
+    avg_loss = loss.ewm(alpha=1/14).mean()
     rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
-
-def atr(df):
-    tr = pd.concat([
-        df["high"] - df["low"],
-        (df["high"] - df["close"].shift()).abs(),
-        (df["low"] - df["close"].shift()).abs()
-    ], axis=1).max(axis=1)
-    return tr.rolling(14).mean()
+    return 100 - (100/(1+rs))
 
 def add_indicators(df):
-    df["EMA200"] = df["close"].ewm(span=200).mean()
+    df["EMA"] = df["close"].ewm(span=200).mean()
     df["RSI"] = rsi(df["close"])
     df["body"] = (df["close"] - df["open"]).abs()
     df["avg_body"] = df["body"].rolling(20).mean()
+    df["vol_avg"] = df["volume"].rolling(20).mean()
     return df
 
 # =========================
-# SIGNAL (2/3 CONFLUENCE)
+# POSITION LOGIC
 # =========================
-def get_signal(symbol):
-    df = market_data[symbol]["5"]
+def calc_position_value():
+    return ACCOUNT_SIZE * LEVERAGE
 
-    if df is None or len(df) < 50:
-        return None
+def get_tp_sl(entry, side):
+    if side == "BUY":
+        tp = entry * (1 + TP_PERCENT)
+        sl = entry * (1 - SL_PERCENT)
+    else:
+        tp = entry * (1 - TP_PERCENT)
+        sl = entry * (1 + SL_PERCENT)
+    return tp, sl
 
+# =========================
+# SIGNAL (2/3)
+# =========================
+def get_signal(df):
     df = add_indicators(df.copy())
 
     signals = []
 
     price = df["close"].iloc[-1]
-    ema = df["EMA200"].iloc[-1]
+    ema = df["EMA"].iloc[-1]
 
     # EMA
     signals.append("BUY" if price > ema else "SELL")
 
     # RSI
     r = df["RSI"].iloc[-2]
-    if r < RSI_OVERSOLD:
+    if r < RSI_OS:
         signals.append("BUY")
-    elif r > RSI_OVERBOUGHT:
+    elif r > RSI_OB:
         signals.append("SELL")
 
     # Candle
@@ -153,6 +112,13 @@ def get_signal(symbol):
         else:
             signals.append("SELL")
 
+    # Volume filter
+    vol = df["volume"].iloc[-1]
+    vol_avg = df["vol_avg"].iloc[-1]
+
+    if vol < vol_avg:
+        return None
+
     if signals.count("BUY") >= 2:
         return "BUY"
     if signals.count("SELL") >= 2:
@@ -161,51 +127,68 @@ def get_signal(symbol):
     return None
 
 # =========================
-# PAPER TRADING
+# PAPER TRADE FUNCTIONS
 # =========================
-def open_trade(symbol, side, price):
-    df = add_indicators(market_data[symbol]["5"].copy())
-    a = atr(df).iloc[-1]
-
-    sl = price - a*0.5 if side == "BUY" else price + a*0.5
-    tp = price + a*1.0 if side == "BUY" else price - a*1.0
+def open_trade(symbol, side, entry):
+    position = calc_position_value()
+    tp, sl = get_tp_sl(entry, side)
 
     trade = {
         "symbol": symbol,
         "side": side,
-        "entry": price,
-        "sl": sl,
+        "entry": entry,
         "tp": tp,
-        "time": now()
+        "sl": sl,
+        "position": position,
+        "status": "OPEN"
     }
 
-    paper_trades["open"].append(trade)
+    open_trades.append(trade)
 
-    send(f"📝 {side} {symbol}\nEntry: {price:.4f}\nSL: {sl:.4f}\nTP: {tp:.4f}")
+    send(
+        f"📝 PAPER TRADE OPEN\n"
+        f"{side} {symbol}\n"
+        f"Entry: {entry:.2f}\n"
+        f"TP: {tp:.2f}\n"
+        f"SL: {sl:.2f}\n"
+        f"Position: ${position}"
+    )
 
-def update_trades(symbol, price):
-    for t in paper_trades["open"][:]:
-        if t["symbol"] != symbol:
+def check_trades(price):
+    for trade in open_trades[:]:
+        if trade["status"] != "OPEN":
             continue
 
-        if t["side"] == "BUY":
-            if price <= t["sl"] or price >= t["tp"]:
-                paper_trades["open"].remove(t)
-                send(f"✅ CLOSED {symbol}")
+        side = trade["side"]
+
+        if side == "BUY":
+            if price >= trade["tp"]:
+                pnl = (TP_PERCENT * trade["position"])
+                close_trade(trade, price, pnl, "TP")
+            elif price <= trade["sl"]:
+                pnl = -(SL_PERCENT * trade["position"])
+                close_trade(trade, price, pnl, "SL")
+
         else:
-            if price >= t["sl"] or price <= t["tp"]:
-                paper_trades["open"].remove(t)
-                send(f"✅ CLOSED {symbol}")
+            if price <= trade["tp"]:
+                pnl = (TP_PERCENT * trade["position"])
+                close_trade(trade, price, pnl, "TP")
+            elif price >= trade["sl"]:
+                pnl = -(SL_PERCENT * trade["position"])
+                close_trade(trade, price, pnl, "SL")
 
-# =========================
-# UNIVERSE
-# =========================
-def get_top_coins():
-    r = session.get(BYBIT_TICKERS_URL, params={"category": "linear"})
-    data = r.json()["result"]["list"]
+def close_trade(trade, price, pnl, reason):
+    trade["status"] = "CLOSED"
 
-    ranked = sorted(data, key=lambda x: float(x["turnover24h"]), reverse=True)
-    return [c["symbol"] for c in ranked[:TOP_N_COINS]]
+    send(
+        f"✅ CLOSED {trade['symbol']}\n"
+        f"{trade['side']}\n"
+        f"Exit: {price:.2f}\n"
+        f"PnL: ${pnl:.2f}\n"
+        f"Reason: {reason}"
+    )
+
+    open_trades.remove(trade)
 
 # =========================
 # WEBSOCKET
@@ -214,7 +197,7 @@ def on_message(ws, message):
     msg = json.loads(message)
     topic = msg.get("topic")
 
-    if not topic or "kline" not in topic:
+    if not topic:
         return
 
     parts = topic.split(".")
@@ -224,70 +207,58 @@ def on_message(ws, message):
     candle = msg["data"][0]
 
     row = {
-        "time": int(candle["start"]),
         "open": float(candle["open"]),
+        "close": float(candle["close"]),
         "high": float(candle["high"]),
         "low": float(candle["low"]),
-        "close": float(candle["close"]),
         "volume": float(candle["volume"]),
-        "turnover": float(candle["turnover"]),
     }
 
-    with data_lock:
-        df = market_data[symbol][tf]
+    df = market_data[symbol][tf]
 
-        if df is None or len(df) == 0:
-            return
+    if df is None or df.empty:
+        market_data[symbol][tf] = pd.DataFrame([row])
+        return
 
-        if candle["confirm"]:
-            df = pd.concat([df, pd.DataFrame([row])]).tail(200)
-            market_data[symbol][tf] = df
+    if candle["confirm"]:
+        df = pd.concat([df, pd.DataFrame([row])]).tail(200)
+        market_data[symbol][tf] = df
 
-            # === ALERTS (independent) ===
-            df_ind = add_indicators(df.copy())
+        df_ind = add_indicators(df.copy())
+        price = df_ind["close"].iloc[-1]
 
-            price = df_ind["close"].iloc[-1]
-            ema = df_ind["EMA200"].iloc[-1]
-            rsi_val = df_ind["RSI"].iloc[-2]
+        # ALERTS
+        r = df_ind["RSI"].iloc[-2]
+        if r < RSI_OS:
+            send(f"RSI OVERSOLD {symbol} {tf}")
+        elif r > RSI_OB:
+            send(f"RSI OVERBOUGHT {symbol} {tf}")
 
-            # EMA alert
-            if abs((price - ema)/ema*100) > 2:
-                send(f"EMA ALERT {symbol} {tf}")
+        # TRADING (5m)
+        if tf == "5":
+            signal = get_signal(df)
 
-            # RSI alert
-            if rsi_val < RSI_OVERSOLD:
-                send(f"RSI OVERSOLD {symbol} {tf}")
-            elif rsi_val > RSI_OVERBOUGHT:
-                send(f"RSI OVERBOUGHT {symbol} {tf}")
+            if signal:
+                open_trade(symbol, signal, price)
 
-            # Candle alert
-            body = df_ind["body"].iloc[-1]
-            avg = df_ind["avg_body"].iloc[-2]
-            if avg > 0 and body > avg * 2:
-                send(f"GIANT CANDLE {symbol} {tf}")
+        check_trades(price)
 
-            # === TRADING (ONLY 5m) ===
-            if tf == "5":
-                signal = get_signal(symbol)
-
-                if signal:
-                    open_trade(symbol, signal, price)
-
-                update_trades(symbol, price)
-
+# =========================
+# START WS
+# =========================
 def start_ws():
     ws = websocket.WebSocketApp(
-        BYBIT_WS_LINEAR,
+        WS_URL,
         on_message=on_message
     )
 
     def on_open(ws):
-        topics = []
-        for c in coins:
+        args = []
+        for s in SYMBOLS:
             for tf in TIMEFRAMES:
-                topics.append(f"kline.{tf}.{c}")
+                args.append(f"kline.{tf}.{s}")
 
-        ws.send(json.dumps({"op": "subscribe", "args": topics}))
+        ws.send(json.dumps({"op": "subscribe", "args": args}))
 
     ws.on_open = on_open
     ws.run_forever()
@@ -295,14 +266,7 @@ def start_ws():
 # =========================
 # START
 # =========================
-coins = get_top_coins()
-
-# preload data
-for c in coins:
-    for tf in TIMEFRAMES:
-        market_data[c][tf] = get_ohlc(c, tf)
-
-send(f"🚀 FULL BOT RUNNING\nCoins: {len(coins)}\nMode: 2/3 Confluence")
+send("🚀 PAPER TRADING BOT RUNNING")
 
 threading.Thread(target=start_ws).start()
 
