@@ -13,8 +13,8 @@ import websocket
 # =========================
 # 🔴 INSERT YOUR DETAILS HERE
 # =========================
-TOKEN = "PASTE_YOUR_TELEGRAM_BOT_TOKEN_HERE"
-CHAT_ID = "PASTE_YOUR_CHAT_ID_HERE"
+TOKEN = "8276758800:AAFGXPI4q4xsZgAbpDqq_PDEsCYu94jaVXs"
+CHAT_ID = "6903033357"
 
 # =========================
 # CONFIG
