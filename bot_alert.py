@@ -35,44 +35,29 @@ TIMEFRAMES = {
 }
 
 EMA_PERIOD = 200
-RSI_PERIOD = 14
 HISTORY_LIMIT = 250
 TOP_SYMBOLS_COUNT = 50
 
 TESTING_MODE = False
 
 # ============================================================
-# LIVE SETTINGS (UPDATED HERE)
+# SETTINGS
 # ============================================================
 
-REAL_EMA_DEVIATION = 0.10   # 🔥 10%
-REAL_RSI_OVERBOUGHT = 95
-REAL_RSI_OVERSOLD = 5
-REAL_LARGE_CANDLE_MIN = 12.0
-REAL_LARGE_CANDLE_STRONG = 15.0
+# LIVE MODE: 65% deviation from EMA200
+REAL_EMA_DEVIATION = 0.65
 
-# ============================================================
-# TEST SETTINGS
-# ============================================================
-
-TEST_EMA_DEVIATION = 0.01
-TEST_RSI_OVERBOUGHT = 51
-TEST_RSI_OVERSOLD = 49
-TEST_LARGE_CANDLE_MIN = 1.2
-TEST_LARGE_CANDLE_STRONG = 1.5
+# TEST MODE: easier to trigger
+TEST_EMA_DEVIATION = 0.01  # 1%
 
 EMA_DEVIATION = REAL_EMA_DEVIATION
-RSI_OVERBOUGHT = REAL_RSI_OVERBOUGHT
-RSI_OVERSOLD = REAL_RSI_OVERSOLD
-LARGE_CANDLE_MIN_RATIO = REAL_LARGE_CANDLE_MIN
-LARGE_CANDLE_STRONG_RATIO = REAL_LARGE_CANDLE_STRONG
 
 # ============================================================
 # GLOBALS
 # ============================================================
 
-candles = {}
-last_alerted_candle = {}
+candles = {}       # (symbol, tf) -> DataFrame
+region_state = {}  # (symbol, tf) -> "ABOVE" / "BELOW" / "NONE"
 SYMBOLS = []
 data_lock = threading.Lock()
 
@@ -81,21 +66,8 @@ data_lock = threading.Lock()
 # ============================================================
 
 def apply_mode():
-    global EMA_DEVIATION, RSI_OVERBOUGHT, RSI_OVERSOLD
-    global LARGE_CANDLE_MIN_RATIO, LARGE_CANDLE_STRONG_RATIO
-
-    if TESTING_MODE:
-        EMA_DEVIATION = TEST_EMA_DEVIATION
-        RSI_OVERBOUGHT = TEST_RSI_OVERBOUGHT
-        RSI_OVERSOLD = TEST_RSI_OVERSOLD
-        LARGE_CANDLE_MIN_RATIO = TEST_LARGE_CANDLE_MIN
-        LARGE_CANDLE_STRONG_RATIO = TEST_LARGE_CANDLE_STRONG
-    else:
-        EMA_DEVIATION = REAL_EMA_DEVIATION
-        RSI_OVERBOUGHT = REAL_RSI_OVERBOUGHT
-        RSI_OVERSOLD = REAL_RSI_OVERSOLD
-        LARGE_CANDLE_MIN_RATIO = REAL_LARGE_CANDLE_MIN
-        LARGE_CANDLE_STRONG_RATIO = REAL_LARGE_CANDLE_STRONG
+    global EMA_DEVIATION
+    EMA_DEVIATION = TEST_EMA_DEVIATION if TESTING_MODE else REAL_EMA_DEVIATION
 
 # ============================================================
 # TELEGRAM
@@ -105,185 +77,413 @@ def send_telegram(msg: str, chat_id=None):
     target = chat_id if chat_id is not None else CHAT_ID
 
     if not TOKEN or not target:
-        print("TELEGRAM SKIPPED")
+        print("TELEGRAM SKIPPED: Missing TOKEN or CHAT_ID")
         return
 
     try:
         url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-        requests.post(url, json={"chat_id": str(target), "text": msg}, timeout=10)
+        payload = {
+            "chat_id": str(target),
+            "text": msg,
+        }
+        r = requests.post(url, json=payload, timeout=10)
+        print("TELEGRAM RESPONSE:", r.status_code, r.text)
     except Exception as e:
         print("TELEGRAM ERROR:", e)
 
-def log_and_alert(msg: str):
+def log_and_alert(msg: str, chat_id=None):
     print(msg)
-    send_telegram(msg)
+    send_telegram(msg, chat_id)
 
 # ============================================================
-# TELEGRAM LISTENER
+# TELEGRAM COMMAND LISTENER
 # ============================================================
 
 def telegram_command_listener():
     if not TOKEN:
+        print("TELEGRAM LISTENER DISABLED: No TOKEN")
         return
 
     global TESTING_MODE
     last_update_id = None
+    url = f"https://api.telegram.org/bot{TOKEN}/getUpdates"
+
+    print("TELEGRAM COMMAND LISTENER STARTED")
 
     while True:
         try:
-            url = f"https://api.telegram.org/bot{TOKEN}/getUpdates"
-            params = {"timeout": 20, "offset": last_update_id}
-            data = requests.get(url, params=params, timeout=30).json()
+            params = {"timeout": 20}
+            if last_update_id is not None:
+                params["offset"] = last_update_id
 
-            for update in data.get("result", []):
+            r = requests.get(url, params=params, timeout=30)
+            data = r.json()
+
+            if "result" not in data:
+                print("TELEGRAM GETUPDATES BAD RESPONSE:", data)
+                time.sleep(2)
+                continue
+
+            for update in data["result"]:
                 last_update_id = update["update_id"] + 1
 
-                msg = update.get("message", {})
+                if "message" not in update:
+                    continue
+
+                msg = update["message"]
                 text = msg.get("text", "").strip()
                 chat_id = msg.get("chat", {}).get("id")
 
+                print("TELEGRAM UPDATE:", text, "FROM CHAT:", chat_id)
+
                 if text == "/test":
-                    send_telegram("🧪 Bot working!", chat_id)
+                    send_telegram("🧪 TEST COMMAND RECEIVED — Bot is working!", chat_id)
 
                 elif text == "/testmode_on":
                     TESTING_MODE = True
                     apply_mode()
-                    send_telegram("🧪 TEST MODE ON", chat_id)
+                    send_telegram(
+                        "🧪 TESTING MODE ENABLED\n"
+                        f"EMA200 deviation threshold: {EMA_DEVIATION * 100:.2f}%\n"
+                        f"Alert logic: trigger once when entering region",
+                        chat_id,
+                    )
 
                 elif text == "/testmode_off":
                     TESTING_MODE = False
                     apply_mode()
-                    send_telegram("✅ LIVE MODE", chat_id)
+                    send_telegram(
+                        "✅ LIVE MODE ENABLED\n"
+                        f"EMA200 deviation threshold: {EMA_DEVIATION * 100:.2f}%\n"
+                        f"Alert logic: trigger once when entering region",
+                        chat_id,
+                    )
 
-        except:
-            time.sleep(2)
+                elif text == "/mode":
+                    mode = "TESTING MODE" if TESTING_MODE else "LIVE MODE"
+                    send_telegram(
+                        f"📌 Current mode: {mode}\n"
+                        f"EMA200 deviation threshold: {EMA_DEVIATION * 100:.2f}%\n"
+                        f"Alert logic: trigger once when entering region",
+                        chat_id,
+                    )
+
+        except Exception as e:
+            print("TELEGRAM LISTENER ERROR:", e)
+            time.sleep(3)
 
 # ============================================================
-# BYBIT DATA
+# BYBIT HELPERS
 # ============================================================
 
-def fetch_top_symbols():
-    r = requests.get(f"{BYBIT_REST}/v5/market/tickers", params={"category": "linear"})
-    data = r.json()["result"]["list"]
+def fetch_top_linear_usdt(count=50):
+    url = f"{BYBIT_REST}/v5/market/tickers"
+    params = {"category": "linear"}
 
-    data = [d for d in data if d["symbol"].endswith("USDT")]
-    data.sort(key=lambda x: float(x["turnover24h"]), reverse=True)
+    try:
+        r = requests.get(url, params=params, timeout=15)
+        data = r.json()
 
-    return [d["symbol"] for d in data[:TOP_SYMBOLS_COUNT]]
+        if data.get("retCode") != 0:
+            print("BYBIT TICKERS ERROR:", data)
+            return []
 
-def fetch_history(symbol, tf):
-    r = requests.get(f"{BYBIT_REST}/v5/market/kline", params={
+        rows = data.get("result", {}).get("list", [])
+        rows = [row for row in rows if row.get("symbol", "").endswith("USDT")]
+
+        def turnover_value(row):
+            try:
+                return float(row.get("turnover24h", 0))
+            except Exception:
+                return 0.0
+
+        rows.sort(key=turnover_value, reverse=True)
+        symbols = [row["symbol"] for row in rows[:count]]
+
+        print(f"TOP {count} LINEAR USDT SYMBOLS:", symbols)
+        return symbols
+
+    except Exception as e:
+        print("FETCH TOP SYMBOLS ERROR:", e)
+        return []
+
+def fetch_historical_klines(symbol: str, interval: str, limit: int = 250):
+    url = f"{BYBIT_REST}/v5/market/kline"
+    params = {
         "category": "linear",
         "symbol": symbol,
-        "interval": tf,
-        "limit": HISTORY_LIMIT
-    })
-    rows = r.json()["result"]["list"]
-    rows.reverse()
+        "interval": interval,
+        "limit": limit,
+    }
 
-    df = pd.DataFrame([{
-        "time": datetime.fromtimestamp(int(r[0]) / 1000, tz=timezone.utc),
-        "open": float(r[1]),
-        "high": float(r[2]),
-        "low": float(r[3]),
-        "close": float(r[4]),
-        "volume": float(r[5]),
-    } for r in rows])
+    try:
+        r = requests.get(url, params=params, timeout=15)
+        data = r.json()
 
-    return df
+        if data.get("retCode") != 0:
+            print(f"HISTORY ERROR {symbol} {interval}:", data)
+            return None
 
-def bootstrap():
-    for s in SYMBOLS:
-        for tf in TIMEFRAMES:
-            candles[(s, tf)] = fetch_history(s, tf)
+        rows = data.get("result", {}).get("list", [])
+        if not rows:
+            print(f"NO HISTORY: {symbol} {interval}")
+            return None
+
+        rows.reverse()
+
+        parsed = []
+        for row in rows:
+            parsed.append({
+                "time": datetime.fromtimestamp(int(row[0]) / 1000, tz=timezone.utc),
+                "open": float(row[1]),
+                "high": float(row[2]),
+                "low": float(row[3]),
+                "close": float(row[4]),
+                "volume": float(row[5]),
+            })
+
+        df = pd.DataFrame(parsed)
+        df = df.drop_duplicates(subset=["time"]).sort_values("time").reset_index(drop=True)
+        return df
+
+    except Exception as e:
+        print(f"FETCH HISTORY ERROR {symbol} {interval}:", e)
+        return None
+
+def bootstrap_history():
+    print("BOOTSTRAPPING HISTORICAL CANDLES...")
+
+    total_loaded = 0
+
+    for symbol in SYMBOLS:
+        for tf in TIMEFRAMES.keys():
+            df = fetch_historical_klines(symbol, tf, HISTORY_LIMIT)
+            if df is not None and not df.empty:
+                with data_lock:
+                    candles[(symbol, tf)] = df
+                    region_state[(symbol, tf)] = "NONE"
+                total_loaded += 1
+                print(f"BOOTSTRAP OK: {symbol} {tf} -> {len(df)} candles")
+            else:
+                print(f"BOOTSTRAP FAILED: {symbol} {tf}")
+            time.sleep(0.03)
+
+    print("BOOTSTRAP COMPLETE. STREAMS LOADED:", total_loaded)
 
 # ============================================================
 # INDICATORS
 # ============================================================
 
-def ema(series, period):
-    return series.ewm(span=period).mean()
-
-def rsi(series, period):
-    delta = series.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-
-    rs = gain.rolling(period).mean() / (loss.rolling(period).mean() + 1e-9)
-    return 100 - (100 / (1 + rs))
+def calc_ema(series: pd.Series, period: int) -> pd.Series:
+    return series.ewm(span=period, adjust=False).mean()
 
 # ============================================================
-# SIGNALS
+# SIGNAL LOGIC
 # ============================================================
 
-def analyze(symbol, tf_label, df):
+def get_price_region(df: pd.DataFrame):
     if len(df) < EMA_PERIOD:
         return None
 
-    df["ema"] = ema(df["close"], EMA_PERIOD)
-    df["rsi"] = rsi(df["close"], RSI_PERIOD)
+    work = df.copy()
+    work["ema200"] = calc_ema(work["close"], EMA_PERIOD)
 
-    last = df.iloc[-1]
+    last = work.iloc[-1]
+    price = float(last["close"])
+    ema200 = float(last["ema200"])
 
-    price = last["close"]
-    ema200 = last["ema"]
+    if ema200 <= 0:
+        return None
 
     deviation = (price - ema200) / ema200
 
     if deviation >= EMA_DEVIATION:
-        return f"📌 {symbol} {tf_label}\nABOVE EMA200 {deviation*100:.2f}%"
+        return {
+            "region": "ABOVE",
+            "price": price,
+            "ema200": ema200,
+            "deviation_pct": deviation * 100.0,
+        }
 
     if deviation <= -EMA_DEVIATION:
-        return f"📌 {symbol} {tf_label}\nBELOW EMA200 {deviation*100:.2f}%"
+        return {
+            "region": "BELOW",
+            "price": price,
+            "ema200": ema200,
+            "deviation_pct": deviation * 100.0,
+        }
+
+    return {
+        "region": "NONE",
+        "price": price,
+        "ema200": ema200,
+        "deviation_pct": deviation * 100.0,
+    }
+
+def build_alert_message(symbol: str, tf_label: str, info: dict):
+    region = info["region"]
+    price = info["price"]
+    ema200 = info["ema200"]
+    deviation_pct = info["deviation_pct"]
+
+    if region == "ABOVE":
+        return (
+            f"🚨 EMA200 REGION ENTERED | {symbol} {tf_label}\n"
+            f"Direction: ABOVE\n"
+            f"Price: {price:.6f}\n"
+            f"EMA200: {ema200:.6f}\n"
+            f"Deviation: +{abs(deviation_pct):.2f}%\n"
+            f"Threshold: {EMA_DEVIATION * 100:.2f}%"
+        )
+
+    if region == "BELOW":
+        return (
+            f"🚨 EMA200 REGION ENTERED | {symbol} {tf_label}\n"
+            f"Direction: BELOW\n"
+            f"Price: {price:.6f}\n"
+            f"EMA200: {ema200:.6f}\n"
+            f"Deviation: -{abs(deviation_pct):.2f}%\n"
+            f"Threshold: {EMA_DEVIATION * 100:.2f}%"
+        )
 
     return None
 
-# ============================================================
-# WS
-# ============================================================
-
-def on_message(ws, msg):
-    data = json.loads(msg)
-
-    if "topic" not in data:
+def process_region_transition(symbol: str, tf: str, tf_label: str, df: pd.DataFrame):
+    info = get_price_region(df)
+    if info is None:
         return
 
-    _, tf, symbol = data["topic"].split(".")
+    new_region = info["region"]
+    key = (symbol, tf)
+    old_region = region_state.get(key, "NONE")
 
-    for k in data["data"]:
-        if not k["confirm"]:
-            continue
+    # No repeat alert while staying in same region
+    if new_region == old_region:
+        return
 
-        df = candles[(symbol, tf)]
-        new = {
-            "time": datetime.fromtimestamp(int(k["start"]) / 1000, tz=timezone.utc),
-            "open": float(k["open"]),
-            "high": float(k["high"]),
-            "low": float(k["low"]),
-            "close": float(k["close"]),
-            "volume": float(k["volume"]),
-        }
+    # Update state
+    region_state[key] = new_region
 
-        df = pd.concat([df, pd.DataFrame([new])]).tail(HISTORY_LIMIT)
-        candles[(symbol, tf)] = df
-
-        msg = analyze(symbol, TIMEFRAMES[tf], df)
+    # Alert only when entering ABOVE or BELOW region
+    if new_region in ("ABOVE", "BELOW"):
+        msg = build_alert_message(symbol, tf_label, info)
         if msg:
             log_and_alert(msg)
 
-def ws_loop():
+# ============================================================
+# CANDLE STORAGE
+# ============================================================
+
+def update_candles(symbol: str, tf: str, kline: dict):
+    key = (symbol, tf)
+
+    ts = datetime.fromtimestamp(int(kline["start"]) / 1000, tz=timezone.utc)
+
+    row = {
+        "time": ts,
+        "open": float(kline["open"]),
+        "high": float(kline["high"]),
+        "low": float(kline["low"]),
+        "close": float(kline["close"]),
+        "volume": float(kline["volume"]),
+    }
+
+    with data_lock:
+        if key not in candles or candles[key].empty:
+            candles[key] = pd.DataFrame([row])
+            return candles[key]
+
+        df = candles[key]
+
+        if df.iloc[-1]["time"] == ts:
+            df.iloc[-1] = [
+                row["time"],
+                row["open"],
+                row["high"],
+                row["low"],
+                row["close"],
+                row["volume"],
+            ]
+        else:
+            df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+            if len(df) > HISTORY_LIMIT + 50:
+                df = df.iloc[-(HISTORY_LIMIT + 20):].reset_index(drop=True)
+            candles[key] = df
+
+        return candles[key]
+
+# ============================================================
+# WEBSOCKET
+# ============================================================
+
+def on_message(ws, message):
+    try:
+        data = json.loads(message)
+    except Exception as e:
+        print("WS PARSE ERROR:", e)
+        return
+
+    if "topic" not in data or "data" not in data:
+        return
+
+    parts = data["topic"].split(".")
+    if len(parts) != 3:
+        return
+
+    _, tf, symbol = parts
+    tf_label = TIMEFRAMES.get(tf, tf)
+
+    klines = data["data"]
+    if isinstance(klines, dict):
+        klines = [klines]
+
+    for kline in klines:
+        try:
+            if not kline.get("confirm", False):
+                continue  # closed candles only
+
+            df = update_candles(symbol, tf, kline)
+            process_region_transition(symbol, tf, tf_label, df)
+
+        except Exception as e:
+            print(f"ON_MESSAGE PROCESS ERROR {symbol} {tf_label}:", e)
+
+def on_error(ws, error):
+    print("WS ERROR:", error)
+
+def on_close(ws, code, msg):
+    print("WS CLOSED:", code, msg)
+
+def on_open(ws):
+    print("WS CONNECTED")
+
+    args = []
+    for symbol in SYMBOLS:
+        for tf in TIMEFRAMES.keys():
+            args.append(f"kline.{tf}.{symbol}")
+
+    try:
+        ws.send(json.dumps({"op": "subscribe", "args": args}))
+        print("SUBSCRIBED TO", len(args), "STREAMS")
+    except Exception as e:
+        print("SUBSCRIBE ERROR:", e)
+
+def ws_forever():
     while True:
-        ws = websocket.WebSocketApp(
-            WS_URL,
-            on_message=on_message
-        )
+        try:
+            print("STARTING WEBSOCKET CONNECTION...")
+            ws = websocket.WebSocketApp(
+                WS_URL,
+                on_open=on_open,
+                on_message=on_message,
+                on_error=on_error,
+                on_close=on_close,
+            )
+            ws.run_forever(ping_interval=20, ping_timeout=10)
+        except Exception as e:
+            print("WEBSOCKET LOOP ERROR:", e)
 
-        def on_open(ws):
-            args = [f"kline.{tf}.{s}" for s in SYMBOLS for tf in TIMEFRAMES]
-            ws.send(json.dumps({"op": "subscribe", "args": args}))
-
-        ws.on_open = on_open
-        ws.run_forever()
+        print("RECONNECTING WEBSOCKET IN 5 SECONDS...")
         time.sleep(5)
 
 # ============================================================
@@ -291,12 +491,32 @@ def ws_loop():
 # ============================================================
 
 if __name__ == "__main__":
+    print("BOT STARTING...")
+
     apply_mode()
 
-    SYMBOLS = fetch_top_symbols()
-    bootstrap()
+    if not TOKEN:
+        print("WARNING: TOKEN is missing")
+    if not CHAT_ID:
+        print("WARNING: CHAT_ID is missing")
 
-    send_telegram("🚀 BOT RUNNING (EMA200 10%)")
+    SYMBOLS = fetch_top_linear_usdt(TOP_SYMBOLS_COUNT)
+    if not SYMBOLS:
+        print("NO SYMBOLS FETCHED — EXITING")
+        raise SystemExit(1)
+
+    bootstrap_history()
+
+    mode = "TESTING MODE" if TESTING_MODE else "LIVE MODE"
+
+    send_telegram(
+        "🚀 EMA200 REGION BOT RUNNING\n"
+        f"Mode: {mode}\n"
+        f"Top {TOP_SYMBOLS_COUNT} Bybit USDT-Perp by volume\n"
+        f"Timeframes: {', '.join(TIMEFRAMES.values())}\n"
+        f"EMA200 deviation threshold: {EMA_DEVIATION * 100:.2f}%\n"
+        f"Alert logic: trigger ONCE when entering region"
+    )
 
     threading.Thread(target=telegram_command_listener, daemon=True).start()
-    ws_loop()
+    ws_forever()
