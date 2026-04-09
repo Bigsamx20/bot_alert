@@ -24,50 +24,84 @@ print("CHAT_ID LOADED:", CHAT_ID is not None)
 # CONFIG
 # ============================================================
 
-WS_URL = "wss://stream.bybit.com/v5/public/linear"
 BYBIT_REST = "https://api.bybit.com"
+WS_URL = "wss://stream.bybit.com/v5/public/linear"
 
+# Bybit intervals -> labels
 TIMEFRAMES = {
     "1": "1m",
     "5": "5m",
-    "15": "15m",
     "60": "1h",
 }
 
 EMA_PERIOD = 200
+RSI_PERIOD = 14
 HISTORY_LIMIT = 250
-TOP_SYMBOLS_COUNT = 50
+
+TOP_VOLUME_COUNT = 40
+TOP_GAINERS_COUNT = 10
+TOTAL_SYMBOLS = 50
+
+# ============================================================
+# MODES & THRESHOLDS
+# ============================================================
 
 TESTING_MODE = False
 
-# ============================================================
-# SETTINGS
-# ============================================================
+# Live thresholds
+REAL_EMA_DEVIATION = 0.65      # 65%
+REAL_RSI_OVERBOUGHT = 95.0
+REAL_RSI_OVERSOLD = 5.0
+REAL_LARGE_CANDLE = 12.0
+REAL_STRONG_CANDLE = 15.0
 
-# LIVE MODE: 65% deviation from EMA200
-REAL_EMA_DEVIATION = 0.65
+# Test thresholds (much more sensitive)
+TEST_EMA_DEVIATION = 0.01      # 1%
+TEST_RSI_OVERBOUGHT = 51.0
+TEST_RSI_OVERSOLD = 49.0
+TEST_LARGE_CANDLE = 1.2
+TEST_STRONG_CANDLE = 1.5
 
-# TEST MODE: easier to trigger
-TEST_EMA_DEVIATION = 0.01  # 1%
+# Active thresholds (will be set by apply_mode)
+EMA_DEVIATION_THRESHOLD = REAL_EMA_DEVIATION
+RSI_OVERBOUGHT = REAL_RSI_OVERBOUGHT
+RSI_OVERSOLD = REAL_RSI_OVERSOLD
+LARGE_CANDLE_RATIO = REAL_LARGE_CANDLE
+STRONG_CANDLE_RATIO = REAL_STRONG_CANDLE
 
-EMA_DEVIATION = REAL_EMA_DEVIATION
+def apply_mode():
+    global EMA_DEVIATION_THRESHOLD, RSI_OVERBOUGHT, RSI_OVERSOLD
+    global LARGE_CANDLE_RATIO, STRONG_CANDLE_RATIO
+
+    if TESTING_MODE:
+        EMA_DEVIATION_THRESHOLD = TEST_EMA_DEVIATION
+        RSI_OVERBOUGHT = TEST_RSI_OVERBOUGHT
+        RSI_OVERSOLD = TEST_RSI_OVERSOLD
+        LARGE_CANDLE_RATIO = TEST_LARGE_CANDLE
+        STRONG_CANDLE_RATIO = TEST_STRONG_CANDLE
+    else:
+        EMA_DEVIATION_THRESHOLD = REAL_EMA_DEVIATION
+        RSI_OVERBOUGHT = REAL_RSI_OVERBOUGHT
+        RSI_OVERSOLD = REAL_RSI_OVERSOLD
+        LARGE_CANDLE_RATIO = REAL_LARGE_CANDLE
+        STRONG_CANDLE_RATIO = REAL_STRONG_CANDLE
 
 # ============================================================
 # GLOBALS
 # ============================================================
 
-candles = {}       # (symbol, tf) -> DataFrame
-region_state = {}  # (symbol, tf) -> "ABOVE" / "BELOW" / "NONE"
 SYMBOLS = []
+candles = {}  # (symbol, tf) -> DataFrame
+
+# indicator_state[(symbol, tf)] = {
+#   "ema_active": bool,
+#   "rsi_active": bool,
+#   "candle_active": bool,
+#   "last_confluence_level": int (0, 2, 3)
+# }
+indicator_state = {}
+
 data_lock = threading.Lock()
-
-# ============================================================
-# MODE CONTROL
-# ============================================================
-
-def apply_mode():
-    global EMA_DEVIATION
-    EMA_DEVIATION = TEST_EMA_DEVIATION if TESTING_MODE else REAL_EMA_DEVIATION
 
 # ============================================================
 # TELEGRAM
@@ -90,6 +124,7 @@ def send_telegram(msg: str, chat_id=None):
         print("TELEGRAM RESPONSE:", r.status_code, r.text)
     except Exception as e:
         print("TELEGRAM ERROR:", e)
+
 
 def log_and_alert(msg: str, chat_id=None):
     print(msg)
@@ -139,13 +174,59 @@ def telegram_command_listener():
                 if text == "/test":
                     send_telegram("🧪 TEST COMMAND RECEIVED — Bot is working!", chat_id)
 
+                elif text == "/help":
+                    send_telegram(
+                        "📖 Commands:\n"
+                        "/test - Check if bot is alive\n"
+                        "/mode - Show current mode & thresholds\n"
+                        "/symbols - Show monitored symbols\n"
+                        "/status - Show basic status\n"
+                        "/testmode_on - Enable Testing Mode\n"
+                        "/testmode_off - Disable Testing Mode",
+                        chat_id,
+                    )
+
+                elif text == "/mode":
+                    mode = "TESTING MODE" if TESTING_MODE else "LIVE MODE"
+                    send_telegram(
+                        f"📌 Current mode: {mode}\n"
+                        f"EMA200 deviation: {EMA_DEVIATION_THRESHOLD * 100:.2f}%\n"
+                        f"RSI extremes: {RSI_OVERSOLD}/{RSI_OVERBOUGHT}\n"
+                        f"Large candle: ≥{LARGE_CANDLE_RATIO}x (strong ≥{STRONG_CANDLE_RATIO}x)",
+                        chat_id,
+                    )
+
+                elif text == "/symbols":
+                    if not SYMBOLS:
+                        send_telegram("No symbols loaded yet.", chat_id)
+                    else:
+                        send_telegram(
+                            "📊 Monitored symbols (" + str(len(SYMBOLS)) + "):\n" +
+                            ", ".join(SYMBOLS),
+                            chat_id,
+                        )
+
+                elif text == "/status":
+                    mode = "TESTING MODE" if TESTING_MODE else "LIVE MODE"
+                    send_telegram(
+                        f"✅ Bot running.\n"
+                        f"Mode: {mode}\n"
+                        f"Symbols: {len(SYMBOLS)}\n"
+                        f"Timeframes: {', '.join(TIMEFRAMES.values())}\n"
+                        f"EMA200 deviation: {EMA_DEVIATION_THRESHOLD * 100:.2f}%\n"
+                        f"RSI extremes: {RSI_OVERSOLD}/{RSI_OVERBOUGHT}\n"
+                        f"Large candle: ≥{LARGE_CANDLE_RATIO}x (strong ≥{STRONG_CANDLE_RATIO}x)",
+                        chat_id,
+                    )
+
                 elif text == "/testmode_on":
                     TESTING_MODE = True
                     apply_mode()
                     send_telegram(
                         "🧪 TESTING MODE ENABLED\n"
-                        f"EMA200 deviation threshold: {EMA_DEVIATION * 100:.2f}%\n"
-                        f"Alert logic: trigger once when entering region",
+                        f"EMA200 deviation: {EMA_DEVIATION_THRESHOLD * 100:.2f}%\n"
+                        f"RSI extremes: {RSI_OVERSOLD}/{RSI_OVERBOUGHT}\n"
+                        f"Large candle: ≥{LARGE_CANDLE_RATIO}x (strong ≥{STRONG_CANDLE_RATIO}x)",
                         chat_id,
                     )
 
@@ -154,17 +235,9 @@ def telegram_command_listener():
                     apply_mode()
                     send_telegram(
                         "✅ LIVE MODE ENABLED\n"
-                        f"EMA200 deviation threshold: {EMA_DEVIATION * 100:.2f}%\n"
-                        f"Alert logic: trigger once when entering region",
-                        chat_id,
-                    )
-
-                elif text == "/mode":
-                    mode = "TESTING MODE" if TESTING_MODE else "LIVE MODE"
-                    send_telegram(
-                        f"📌 Current mode: {mode}\n"
-                        f"EMA200 deviation threshold: {EMA_DEVIATION * 100:.2f}%\n"
-                        f"Alert logic: trigger once when entering region",
+                        f"EMA200 deviation: {EMA_DEVIATION_THRESHOLD * 100:.2f}%\n"
+                        f"RSI extremes: {RSI_OVERSOLD}/{RSI_OVERBOUGHT}\n"
+                        f"Large candle: ≥{LARGE_CANDLE_RATIO}x (strong ≥{STRONG_CANDLE_RATIO}x)",
                         chat_id,
                     )
 
@@ -176,38 +249,66 @@ def telegram_command_listener():
 # BYBIT HELPERS
 # ============================================================
 
-def fetch_top_linear_usdt(count=50):
+def fetch_all_linear_tickers():
     url = f"{BYBIT_REST}/v5/market/tickers"
     params = {"category": "linear"}
-
     try:
         r = requests.get(url, params=params, timeout=15)
         data = r.json()
-
         if data.get("retCode") != 0:
             print("BYBIT TICKERS ERROR:", data)
             return []
-
         rows = data.get("result", {}).get("list", [])
         rows = [row for row in rows if row.get("symbol", "").endswith("USDT")]
-
-        def turnover_value(row):
-            try:
-                return float(row.get("turnover24h", 0))
-            except Exception:
-                return 0.0
-
-        rows.sort(key=turnover_value, reverse=True)
-        symbols = [row["symbol"] for row in rows[:count]]
-
-        print(f"TOP {count} LINEAR USDT SYMBOLS:", symbols)
-        return symbols
-
+        return rows
     except Exception as e:
-        print("FETCH TOP SYMBOLS ERROR:", e)
+        print("FETCH TICKERS ERROR:", e)
         return []
 
-def fetch_historical_klines(symbol: str, interval: str, limit: int = 250):
+
+def fetch_top_symbols():
+    """
+    Total = 50 coins
+    - 40 top by volume
+    - 10 top gainers
+    """
+    rows = fetch_all_linear_tickers()
+    if not rows:
+        return []
+
+    # Top 40 by volume (turnover24h)
+    def turnover_value(row):
+        try:
+            return float(row.get("turnover24h", 0))
+        except Exception:
+            return 0.0
+
+    sorted_by_turnover = sorted(rows, key=turnover_value, reverse=True)
+    top_volume = [row["symbol"] for row in sorted_by_turnover[:TOP_VOLUME_COUNT]]
+
+    # Top 10 gainers by price24hPcnt
+    def pct_change(row):
+        try:
+            return float(row.get("price24hPcnt", 0))
+        except Exception:
+            return 0.0
+
+    sorted_by_gainers = sorted(rows, key=pct_change, reverse=True)
+    top_gainers = [row["symbol"] for row in sorted_by_gainers[:TOP_GAINERS_COUNT]]
+
+    combined = []
+    seen = set()
+    for sym in top_volume + top_gainers:
+        if sym not in seen:
+            seen.add(sym)
+            combined.append(sym)
+
+    combined = combined[:TOTAL_SYMBOLS]
+    print("TOP SYMBOLS (VOLUME + GAINERS):", combined)
+    return combined
+
+
+def fetch_historical_klines(symbol: str, interval: str, limit: int = HISTORY_LIMIT):
     url = f"{BYBIT_REST}/v5/market/kline"
     params = {
         "category": "linear",
@@ -250,6 +351,7 @@ def fetch_historical_klines(symbol: str, interval: str, limit: int = 250):
         print(f"FETCH HISTORY ERROR {symbol} {interval}:", e)
         return None
 
+
 def bootstrap_history():
     print("BOOTSTRAPPING HISTORICAL CANDLES...")
 
@@ -261,7 +363,12 @@ def bootstrap_history():
             if df is not None and not df.empty:
                 with data_lock:
                     candles[(symbol, tf)] = df
-                    region_state[(symbol, tf)] = "NONE"
+                    indicator_state[(symbol, tf)] = {
+                        "ema_active": False,
+                        "rsi_active": False,
+                        "candle_active": False,
+                        "last_confluence_level": 0,
+                    }
                 total_loaded += 1
                 print(f"BOOTSTRAP OK: {symbol} {tf} -> {len(df)} candles")
             else:
@@ -277,246 +384,40 @@ def bootstrap_history():
 def calc_ema(series: pd.Series, period: int) -> pd.Series:
     return series.ewm(span=period, adjust=False).mean()
 
+
+def calc_rsi(series: pd.Series, period: int = RSI_PERIOD) -> pd.Series:
+    delta = series.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+
+    avg_gain = gain.rolling(window=period, min_periods=period).mean()
+    avg_loss = loss.rolling(window=period, min_periods=period).mean()
+
+    avg_gain = avg_gain.ewm(alpha=1/period, adjust=False).mean()
+    avg_loss = avg_loss.ewm(alpha=1/period, adjust=False).mean()
+
+    rs = avg_gain / avg_loss.replace(0, 1e-10)
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
 # ============================================================
 # SIGNAL LOGIC
 # ============================================================
 
-def get_price_region(df: pd.DataFrame):
-    if len(df) < EMA_PERIOD:
-        return None
-
-    work = df.copy()
-    work["ema200"] = calc_ema(work["close"], EMA_PERIOD)
-
-    last = work.iloc[-1]
-    price = float(last["close"])
-    ema200 = float(last["ema200"])
-
-    if ema200 <= 0:
-        return None
-
-    deviation = (price - ema200) / ema200
-
-    if deviation >= EMA_DEVIATION:
-        return {
-            "region": "ABOVE",
-            "price": price,
-            "ema200": ema200,
-            "deviation_pct": deviation * 100.0,
-        }
-
-    if deviation <= -EMA_DEVIATION:
-        return {
-            "region": "BELOW",
-            "price": price,
-            "ema200": ema200,
-            "deviation_pct": deviation * 100.0,
-        }
-
-    return {
-        "region": "NONE",
-        "price": price,
-        "ema200": ema200,
-        "deviation_pct": deviation * 100.0,
-    }
-
-def build_alert_message(symbol: str, tf_label: str, info: dict):
-    region = info["region"]
-    price = info["price"]
-    ema200 = info["ema200"]
-    deviation_pct = info["deviation_pct"]
-
-    if region == "ABOVE":
-        return (
-            f"🚨 EMA200 REGION ENTERED | {symbol} {tf_label}\n"
-            f"Direction: ABOVE\n"
-            f"Price: {price:.6f}\n"
-            f"EMA200: {ema200:.6f}\n"
-            f"Deviation: +{abs(deviation_pct):.2f}%\n"
-            f"Threshold: {EMA_DEVIATION * 100:.2f}%"
-        )
-
-    if region == "BELOW":
-        return (
-            f"🚨 EMA200 REGION ENTERED | {symbol} {tf_label}\n"
-            f"Direction: BELOW\n"
-            f"Price: {price:.6f}\n"
-            f"EMA200: {ema200:.6f}\n"
-            f"Deviation: -{abs(deviation_pct):.2f}%\n"
-            f"Threshold: {EMA_DEVIATION * 100:.2f}%"
-        )
-
-    return None
-
-def process_region_transition(symbol: str, tf: str, tf_label: str, df: pd.DataFrame):
-    info = get_price_region(df)
-    if info is None:
+def evaluate_indicators(symbol: str, tf: str, tf_label: str, df: pd.DataFrame):
+    """
+    For the latest closed candle:
+    - EMA200 deviation
+    - RSI(14)
+    - Large candle ratio
+    Then:
+    - Send single alerts (on activation only)
+    - Send confluence alerts (2/3, 3/3) on activation only
+    """
+    if len(df) < max(EMA_PERIOD, RSI_PERIOD + 1, 2):
         return
 
-    new_region = info["region"]
     key = (symbol, tf)
-    old_region = region_state.get(key, "NONE")
-
-    # No repeat alert while staying in same region
-    if new_region == old_region:
-        return
-
-    # Update state
-    region_state[key] = new_region
-
-    # Alert only when entering ABOVE or BELOW region
-    if new_region in ("ABOVE", "BELOW"):
-        msg = build_alert_message(symbol, tf_label, info)
-        if msg:
-            log_and_alert(msg)
-
-# ============================================================
-# CANDLE STORAGE
-# ============================================================
-
-def update_candles(symbol: str, tf: str, kline: dict):
-    key = (symbol, tf)
-
-    ts = datetime.fromtimestamp(int(kline["start"]) / 1000, tz=timezone.utc)
-
-    row = {
-        "time": ts,
-        "open": float(kline["open"]),
-        "high": float(kline["high"]),
-        "low": float(kline["low"]),
-        "close": float(kline["close"]),
-        "volume": float(kline["volume"]),
-    }
-
-    with data_lock:
-        if key not in candles or candles[key].empty:
-            candles[key] = pd.DataFrame([row])
-            return candles[key]
-
-        df = candles[key]
-
-        if df.iloc[-1]["time"] == ts:
-            df.iloc[-1] = [
-                row["time"],
-                row["open"],
-                row["high"],
-                row["low"],
-                row["close"],
-                row["volume"],
-            ]
-        else:
-            df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
-            if len(df) > HISTORY_LIMIT + 50:
-                df = df.iloc[-(HISTORY_LIMIT + 20):].reset_index(drop=True)
-            candles[key] = df
-
-        return candles[key]
-
-# ============================================================
-# WEBSOCKET
-# ============================================================
-
-def on_message(ws, message):
-    try:
-        data = json.loads(message)
-    except Exception as e:
-        print("WS PARSE ERROR:", e)
-        return
-
-    if "topic" not in data or "data" not in data:
-        return
-
-    parts = data["topic"].split(".")
-    if len(parts) != 3:
-        return
-
-    _, tf, symbol = parts
-    tf_label = TIMEFRAMES.get(tf, tf)
-
-    klines = data["data"]
-    if isinstance(klines, dict):
-        klines = [klines]
-
-    for kline in klines:
-        try:
-            if not kline.get("confirm", False):
-                continue  # closed candles only
-
-            df = update_candles(symbol, tf, kline)
-            process_region_transition(symbol, tf, tf_label, df)
-
-        except Exception as e:
-            print(f"ON_MESSAGE PROCESS ERROR {symbol} {tf_label}:", e)
-
-def on_error(ws, error):
-    print("WS ERROR:", error)
-
-def on_close(ws, code, msg):
-    print("WS CLOSED:", code, msg)
-
-def on_open(ws):
-    print("WS CONNECTED")
-
-    args = []
-    for symbol in SYMBOLS:
-        for tf in TIMEFRAMES.keys():
-            args.append(f"kline.{tf}.{symbol}")
-
-    try:
-        ws.send(json.dumps({"op": "subscribe", "args": args}))
-        print("SUBSCRIBED TO", len(args), "STREAMS")
-    except Exception as e:
-        print("SUBSCRIBE ERROR:", e)
-
-def ws_forever():
-    while True:
-        try:
-            print("STARTING WEBSOCKET CONNECTION...")
-            ws = websocket.WebSocketApp(
-                WS_URL,
-                on_open=on_open,
-                on_message=on_message,
-                on_error=on_error,
-                on_close=on_close,
-            )
-            ws.run_forever(ping_interval=20, ping_timeout=10)
-        except Exception as e:
-            print("WEBSOCKET LOOP ERROR:", e)
-
-        print("RECONNECTING WEBSOCKET IN 5 SECONDS...")
-        time.sleep(5)
-
-# ============================================================
-# MAIN
-# ============================================================
-
-if __name__ == "__main__":
-    print("BOT STARTING...")
-
-    apply_mode()
-
-    if not TOKEN:
-        print("WARNING: TOKEN is missing")
-    if not CHAT_ID:
-        print("WARNING: CHAT_ID is missing")
-
-    SYMBOLS = fetch_top_linear_usdt(TOP_SYMBOLS_COUNT)
-    if not SYMBOLS:
-        print("NO SYMBOLS FETCHED — EXITING")
-        raise SystemExit(1)
-
-    bootstrap_history()
-
-    mode = "TESTING MODE" if TESTING_MODE else "LIVE MODE"
-
-    send_telegram(
-        "🚀 EMA200 REGION BOT RUNNING\n"
-        f"Mode: {mode}\n"
-        f"Top {TOP_SYMBOLS_COUNT} Bybit USDT-Perp by volume\n"
-        f"Timeframes: {', '.join(TIMEFRAMES.values())}\n"
-        f"EMA200 deviation threshold: {EMA_DEVIATION * 100:.2f}%\n"
-        f"Alert logic: trigger ONCE when entering region"
-    )
-
-    threading.Thread(target=telegram_command_listener, daemon=True).start()
-    ws_forever()
+    state = indicator_state.setdefault(key, {
+        "ema_active": False,
+        "rsi_active": False
