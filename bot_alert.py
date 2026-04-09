@@ -1,3 +1,5 @@
+print("🔥 BOT STARTED — BEFORE IMPORTS")
+
 import os
 import json
 import time
