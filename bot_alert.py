@@ -33,16 +33,52 @@ TIMEFRAMES = {
     "60": "1h",
 }
 
-# Indicators
+# Indicator base periods
 EMA_PERIOD = 200
-EMA_DEVIATION = 0.70  # 70% above/below EMA200
-
 RSI_PERIOD = 14
-RSI_OVERBOUGHT = 95
-RSI_OVERSOLD = 5
 
-LARGE_CANDLE_MIN_RATIO = 12.0
-LARGE_CANDLE_STRONG_RATIO = 15.0
+# -------- Testing Mode System --------
+TESTING_MODE = False
+
+# Real settings
+REAL_EMA_DEVIATION = 0.70
+REAL_RSI_OVERBOUGHT = 95
+REAL_RSI_OVERSOLD = 5
+REAL_LARGE_CANDLE_MIN = 12.0
+REAL_LARGE_CANDLE_STRONG = 15.0
+
+# Testing settings (very sensitive)
+TEST_EMA_DEVIATION = 0.01
+TEST_RSI_OVERBOUGHT = 51
+TEST_RSI_OVERSOLD = 49
+TEST_LARGE_CANDLE_MIN = 1.2
+TEST_LARGE_CANDLE_STRONG = 1.5
+
+# Working settings (will be set by apply_mode)
+EMA_DEVIATION = REAL_EMA_DEVIATION
+RSI_OVERBOUGHT = REAL_RSI_OVERBOUGHT
+RSI_OVERSOLD = REAL_RSI_OVERSOLD
+LARGE_CANDLE_MIN_RATIO = REAL_LARGE_CANDLE_MIN
+LARGE_CANDLE_STRONG_RATIO = REAL_LARGE_CANDLE_STRONG
+
+
+def apply_mode():
+    global EMA_DEVIATION, RSI_OVERBOUGHT, RSI_OVERSOLD
+    global LARGE_CANDLE_MIN_RATIO, LARGE_CANDLE_STRONG_RATIO
+
+    if TESTING_MODE:
+        EMA_DEVIATION = TEST_EMA_DEVIATION
+        RSI_OVERBOUGHT = TEST_RSI_OVERBOUGHT
+        RSI_OVERSOLD = TEST_RSI_OVERSOLD
+        LARGE_CANDLE_MIN_RATIO = TEST_LARGE_CANDLE_MIN
+        LARGE_CANDLE_STRONG_RATIO = TEST_LARGE_CANDLE_STRONG
+    else:
+        EMA_DEVIATION = REAL_EMA_DEVIATION
+        RSI_OVERBOUGHT = REAL_RSI_OVERBOUGHT
+        RSI_OVERSOLD = REAL_RSI_OVERSOLD
+        LARGE_CANDLE_MIN_RATIO = REAL_LARGE_CANDLE_MIN
+        LARGE_CANDLE_STRONG_RATIO = REAL_LARGE_CANDLE_STRONG
+
 
 # Data storage
 candles = {}  # (symbol, tf) -> DataFrame
@@ -71,13 +107,15 @@ def log_and_alert(msg: str):
     send_telegram(msg)
 
 # ============================================================
-# TELEGRAM COMMAND LISTENER (/test)
+# TELEGRAM COMMAND LISTENER (/test + testing mode)
 # ============================================================
 
 def telegram_command_listener():
     if not TOKEN:
         print("TELEGRAM LISTENER DISABLED: No TOKEN")
         return
+
+    global TESTING_MODE
 
     last_update_id = None
     url = f"https://api.telegram.org/bot{TOKEN}/getUpdates"
@@ -104,8 +142,50 @@ def telegram_command_listener():
 
                 print("TELEGRAM UPDATE:", text, "FROM CHAT:", chat_id)
 
-                if text.strip() == "/test":
+                t = text.strip()
+
+                # /test
+                if t == "/test":
                     send_telegram("🧪 TEST COMMAND RECEIVED — Bot is working!", chat_id)
+                    continue
+
+                # /testmode_on
+                if t == "/testmode_on":
+                    TESTING_MODE = True
+                    apply_mode()
+                    send_telegram(
+                        "🧪 TESTING MODE ENABLED\n"
+                        "EMA deviation: 1%\n"
+                        "RSI: 49/51\n"
+                        "Large candle: ≥1.2x (strong ≥1.5x)",
+                        chat_id,
+                    )
+                    continue
+
+                # /testmode_off
+                if t == "/testmode_off":
+                    TESTING_MODE = False
+                    apply_mode()
+                    send_telegram(
+                        "✅ TESTING MODE DISABLED\n"
+                        f"EMA deviation: {REAL_EMA_DEVIATION*100:.0f}%\n"
+                        f"RSI: {REAL_RSI_OVERSOLD}/{REAL_RSI_OVERBOUGHT}\n"
+                        f"Large candle: ≥{REAL_LARGE_CANDLE_MIN}x (strong ≥{REAL_LARGE_CANDLE_STRONG}x)",
+                        chat_id,
+                    )
+                    continue
+
+                # /mode
+                if t == "/mode":
+                    mode = "TESTING MODE" if TESTING_MODE else "LIVE MODE"
+                    send_telegram(
+                        f"📌 Current mode: {mode}\n"
+                        f"EMA deviation: {EMA_DEVIATION*100:.2f}%\n"
+                        f"RSI: {RSI_OVERSOLD}/{RSI_OVERBOUGHT}\n"
+                        f"Large candle: ≥{LARGE_CANDLE_MIN_RATIO}x (strong ≥{LARGE_CANDLE_STRONG_RATIO}x)",
+                        chat_id,
+                    )
+                    continue
 
         except Exception as e:
             print("TELEGRAM LISTENER ERROR:", e)
@@ -129,7 +209,7 @@ def fetch_top_50_linear_usdt():
         # Filter USDT pairs only
         rows = [row for row in rows if row.get("symbol", "").endswith("USDT")]
 
-        # Sort by 24h turnover (or volume)
+        # Sort by 24h turnover
         def _vol(row):
             try:
                 return float(row.get("turnover24h", "0"))
@@ -229,15 +309,6 @@ def update_candles(symbol: str, tf: str, kline: dict):
 # ============================================================
 
 def analyze_signals(symbol: str, tf: str, df: pd.DataFrame):
-    """
-    Returns dict with:
-      ema_signal: None / "ABOVE" / "BELOW"
-      ema_info: (price, ema, deviation_pct)
-      rsi_signal: None / "OVERBOUGHT" / "OVERSOLD"
-      rsi_value: float
-      lc_signal: None / "LARGE" / "LARGE_STRONG"
-      lc_ratio: float or None
-    """
     if len(df) < max(EMA_PERIOD, RSI_PERIOD + 1):
         return None
 
@@ -287,10 +358,8 @@ def analyze_signals(symbol: str, tf: str, df: pd.DataFrame):
         "lc_ratio": lc_ratio,
     }
 
+
 def build_alert_message(symbol: str, tf: str, sig: dict):
-    """
-    Build alert text based on which conditions are active.
-    """
     conditions = []
 
     # EMA
@@ -424,17 +493,23 @@ def start_ws():
 if __name__ == "__main__":
     print("BOT STARTING...")
 
+    # Apply initial mode (LIVE by default)
+    apply_mode()
+
     # Fetch top 50 linear USDT symbols
     SYMBOLS = fetch_top_50_linear_usdt()
     if not SYMBOLS:
         print("NO SYMBOLS FETCHED — EXITING")
         exit(1)
 
+    mode = "TESTING MODE" if TESTING_MODE else "LIVE MODE"
+
     send_telegram(
         "🚀 DERIVATIVES SCANNER RUNNING\n"
+        f"Mode: {mode}\n"
         f"Top 50 Bybit USDT-Perp by volume\n"
         f"Timeframes: {', '.join(TIMEFRAMES.values())}\n"
-        f"EMA200 deviation: {EMA_DEVIATION*100:.0f}%\n"
+        f"EMA200 deviation: {EMA_DEVIATION*100:.2f}%\n"
         f"RSI extremes: {RSI_OVERSOLD}/{RSI_OVERBOUGHT}\n"
         f"Large candle: ≥{LARGE_CANDLE_MIN_RATIO}x (strong ≥{LARGE_CANDLE_STRONG_RATIO}x)"
     )
